@@ -3,12 +3,24 @@
 
 import frappe
 
+from pos_prime.api._utils import validate_doctype_permissions, validate_pos_access
+
+
+def _validate_customer_read(customer):
+    validate_pos_access()
+    if not frappe.db.exists("Customer", customer):
+        return None
+    customer_doc = frappe.get_doc("Customer", customer)
+    validate_doctype_permissions("Customer", "read", doc=customer_doc)
+    return customer_doc
+
 
 @frappe.whitelist()
 def get_customer_addresses(customer):
     """Get all addresses linked to a customer."""
-    if not frappe.db.exists("Customer", customer):
+    if not _validate_customer_read(customer):
         return []
+    validate_doctype_permissions("Address", "read")
 
     address_names = frappe.get_all(
         "Dynamic Link",
@@ -18,7 +30,7 @@ def get_customer_addresses(customer):
     if not address_names:
         return []
 
-    addresses = frappe.get_all(
+    addresses = frappe.get_list(
         "Address",
         filters={"name": ["in", address_names]},
         fields=["name", "address_title", "address_type", "address_line1", "address_line2",
@@ -36,8 +48,9 @@ def get_customer_addresses(customer):
 @frappe.whitelist()
 def get_customer_contacts(customer):
     """Get all contacts linked to a customer."""
-    if not frappe.db.exists("Customer", customer):
+    if not _validate_customer_read(customer):
         return []
+    validate_doctype_permissions("Contact", "read")
 
     contact_names = frappe.get_all(
         "Dynamic Link",
@@ -47,7 +60,7 @@ def get_customer_contacts(customer):
     if not contact_names:
         return []
 
-    contacts = frappe.get_all(
+    contacts = frappe.get_list(
         "Contact",
         filters={"name": ["in", contact_names]},
         fields=["name", "first_name", "last_name", "email_id", "phone", "mobile_no",

@@ -69,7 +69,8 @@ function onItemSelect(index: number) {
 
 function onUpdateQty(index: number, qty: number) {
   if (cartStore.items[index]?.is_free_item) return
-  cartStore.updateQty(index, qty)
+  const err = cartStore.updateQty(index, qty, undefined, settingsStore.validateStockOnSave)
+  if (err) showStockError(err)
 }
 
 function onRemove(index: number) {
@@ -81,7 +82,17 @@ function onRemove(index: number) {
 function onNumPadUpdate(value: number) {
   if (cartStore.selectedItemIndex === null) return
   if (numPadMode.value === 'qty') {
-    cartStore.updateQty(cartStore.selectedItemIndex, value)
+    const err = cartStore.updateQty(
+      cartStore.selectedItemIndex,
+      value,
+      undefined,
+      settingsStore.validateStockOnSave
+    )
+    if (err) {
+      showStockError(err)
+      const item = cartStore.items[cartStore.selectedItemIndex]
+      if (item) keyboardInput.value = String(item.qty)
+    }
   } else if (numPadMode.value === 'discount') {
     cartStore.updateItemDiscount(cartStore.selectedItemIndex, value)
   } else if (numPadMode.value === 'discountAmt') {
@@ -108,7 +119,14 @@ function closeKeyboardInput() {
   showNumPad.value = false
 }
 
-function openPayment() {
+function showStockError(message: string) {
+  const frappe = (window as any).frappe
+  if (frappe?.show_alert) frappe.show_alert({ message, indicator: 'orange' }, 3)
+}
+
+async function openPayment() {
+  await cartStore.flushTaxCalculation()
+  if (cartStore.error) return
   paymentStore.openPaymentDialog()
 }
 
@@ -272,9 +290,9 @@ const emit = defineEmits<{
         </button>
         <button
           @click="openPayment"
-          :disabled="cartStore.items.length === 0 || !customerStore.customer"
+          :disabled="cartStore.items.length === 0 || !customerStore.customer || cartStore.taxCalculating || cartStore.taxCalculationPending"
           class="checkout-btn flex-1 py-2.5 rounded-lg text-sm font-bold transition-all duration-200 flex items-center justify-center gap-2 text-white disabled:cursor-not-allowed"
-          :class="cartStore.items.length > 0 && customerStore.customer
+          :class="cartStore.items.length > 0 && customerStore.customer && !cartStore.taxCalculating && !cartStore.taxCalculationPending
             ? 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600'
             : 'bg-blue-300 dark:bg-blue-800 opacity-70'"
         >

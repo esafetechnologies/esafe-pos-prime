@@ -4,20 +4,27 @@
 import frappe
 from frappe import _
 
+from pos_prime.api._utils import validate_doctype_permissions, validate_pos_access
+
 
 @frappe.whitelist()
 def get_customer_loyalty(customer):
     """Get loyalty program data for a customer."""
+    validate_pos_access()
     try:
         if not frappe.db.exists("Customer", customer):
             frappe.throw(_("Customer {0} does not exist").format(customer))
 
         customer_doc = frappe.get_doc("Customer", customer)
+        validate_doctype_permissions("Customer", "read", doc=customer_doc)
 
         if not customer_doc.loyalty_program:
             return None
 
         loyalty_program = frappe.get_doc("Loyalty Program", customer_doc.loyalty_program)
+        validate_doctype_permissions(
+            "Loyalty Program", "read", doc=loyalty_program
+        )
 
         # Get customer's current loyalty points (include NULL expiry = lifetime points)
         loyalty_points = frappe.db.sql(
@@ -48,7 +55,7 @@ def get_customer_loyalty(customer):
             "cost_center": cost_center,
             "max_redeemable_amount": points * conversion_factor if conversion_factor else 0,
         }
-    except frappe.DoesNotExistError:
+    except (frappe.DoesNotExistError, frappe.PermissionError):
         raise
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "POS Prime: get_customer_loyalty failed")

@@ -38,7 +38,7 @@ export const test = base.extend<{
     await use(data)
   },
 
-  posPage: async ({ page, baseURL }, use) => {
+  posPage: async ({ page, baseURL, testData: _testData }, use) => {
     // Login via browser
     await page.goto(`${baseURL}/login`, { waitUntil: 'domcontentloaded' })
     await page.waitForTimeout(500)
@@ -49,9 +49,10 @@ export const test = base.extend<{
       await page.locator('input[type="text"]#login_email, input[data-fieldname="usr"]').first().fill('Administrator')
       await page.locator('input[type="password"]#login_password, input[data-fieldname="pwd"]').first().fill('admin')
       await page.locator('button[type="submit"], .btn-login, .btn-primary-dark').first().click()
-      await page.waitForURL('**/app/**', { timeout: 15_000 }).catch(() => {
-        // v16 uses /desk/ instead of /app/
-      })
+      await page.waitForURL(
+        url => !url.pathname.startsWith('/login'),
+        { timeout: 15_000 }
+      )
       await page.waitForTimeout(1000)
     }
 
@@ -72,23 +73,40 @@ let _cachedTestData: TestData | null = null
 
 async function discoverTestData(api: FrappeAPI): Promise<TestData> {
   if (_cachedTestData) return _cachedTestData
-  // 1. Find the first POS Profile assigned to Administrator
-  const profiles = await api.getList(
-    'POS Profile',
-    {},
-    ['name', 'company', 'warehouse', 'customer', 'selling_price_list'],
-    10
+  // 1. Match the profile the UI will use. A test site can legitimately have
+  // several open sessions; POS Prime selects the newest active opening.
+  const openings = await api.getList(
+    'POS Opening Entry',
+    { user: 'Administrator', status: 'Open', docstatus: 1 },
+    ['name', 'pos_profile', 'creation'],
+    50
   )
-  if (!profiles.length) throw new Error('No POS Profile found on site')
+  openings.sort((a: any, b: any) =>
+    String(b.creation || '').localeCompare(String(a.creation || ''))
+  )
 
-  // Prefer one that has Administrator in applicable_for_users
-  let profile = profiles[0]
-  for (const p of profiles) {
-    const doc = await api.getDoc('POS Profile', p.name)
-    const users = doc?.applicable_for_users || []
-    if (users.some((u: any) => u.user === 'Administrator')) {
-      profile = { ...p, ...doc }
-      break
+  let profile = openings[0]?.pos_profile
+    ? await api.getDoc('POS Profile', openings[0].pos_profile)
+    : null
+
+  if (!profile) {
+    const profiles = await api.getList(
+      'POS Profile',
+      {},
+      ['name', 'company', 'warehouse', 'customer', 'selling_price_list'],
+      10
+    )
+    if (!profiles.length) throw new Error('No POS Profile found on site')
+
+    // Prefer one that has Administrator in applicable_for_users.
+    profile = profiles[0]
+    for (const p of profiles) {
+      const doc = await api.getDoc('POS Profile', p.name)
+      const users = doc?.applicable_for_users || []
+      if (users.some((u: any) => u.user === 'Administrator')) {
+        profile = { ...p, ...doc }
+        break
+      }
     }
   }
 
@@ -123,6 +141,11 @@ async function discoverTestData(api: FrappeAPI): Promise<TestData> {
   }
   try {
     await api.setDocValue('POS Profile', posProfile, 'ignore_pricing_rule', 1)
+  } catch {
+    // Field may not exist on all versions
+  }
+  try {
+    await api.setDocValue('POS Profile', posProfile, 'allow_discount_change', 1)
   } catch {
     // Field may not exist on all versions
   }

@@ -4,25 +4,66 @@
 """Shared utility functions for POS Prime API endpoints."""
 
 import frappe
+from frappe import _
+from frappe.utils import flt
 
 
-def validate_pos_access(pos_profile=None):
+def _as_permission_list(permissions):
+    if not permissions:
+        return ("read",)
+    if isinstance(permissions, str):
+        return (permissions,)
+    return tuple(permissions)
+
+
+def validate_doctype_permissions(doctype, permissions="read", doc=None):
+    """Require every requested permission on a doctype or document."""
+    for permission_type in _as_permission_list(permissions):
+        if not frappe.has_permission(doctype, ptype=permission_type, doc=doc):
+            frappe.throw(
+                _("You do not have {0} permission for {1}.").format(
+                    permission_type, doctype
+                ),
+                frappe.PermissionError,
+            )
+
+
+def is_pos_manager():
+    """Return whether the current user may operate on another user's shift/draft."""
+    return frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles(
+        frappe.session.user
+    )
+
+
+def validate_document_owner(doc, owner_field="owner"):
+    """Keep cashier-scoped records private unless the user is a system manager."""
+    owner = doc.get(owner_field)
+    if owner and owner != frappe.session.user and not is_pos_manager():
+        frappe.throw(
+            _("You can only access your own POS records."),
+            frappe.PermissionError,
+        )
+
+
+def validate_pos_access(pos_profile=None, permissions="read", doctype="POS Invoice"):
     """Validate that the current user has POS access.
 
     Checks:
-    1. User has read permission on POS Invoice (respects Role Permissions Manager,
-       including custom roles like "POS Operator", "Cashier", etc.).
-    2. If pos_profile is provided, user is in the profile's applicable_for_users
+    1. User has read permission on POS Invoice, proving that the user is a POS user.
+    2. User has the endpoint-specific permissions requested for ``doctype``.
+    3. If pos_profile is provided, user is in the profile's applicable_for_users
        (or the list is empty, meaning all users are allowed).
 
     Raises frappe.PermissionError if not authorized.
     """
-    if not frappe.has_permission("POS Invoice", "read"):
+    if not frappe.has_permission("POS Invoice", ptype="read"):
         frappe.throw(
             "You do not have permission to access POS. "
             "Please contact your administrator to grant POS Invoice access.",
             frappe.PermissionError,
         )
+
+    validate_doctype_permissions(doctype, permissions)
 
     if pos_profile:
         if not frappe.db.exists("POS Profile", pos_profile):
@@ -40,6 +81,20 @@ def validate_pos_access(pos_profile=None):
                 )
 
 
+def validate_pos_document_access(
+    doc,
+    permissions="read",
+    owner_field=None,
+    pos_profile_field="pos_profile",
+):
+    """Validate POS membership, document permissions, profile scope, and ownership."""
+    pos_profile = doc.get(pos_profile_field) if pos_profile_field else None
+    validate_pos_access(pos_profile)
+    validate_doctype_permissions(doc.doctype, permissions, doc=doc)
+    if owner_field:
+        validate_document_owner(doc, owner_field)
+
+
 def safe_float(value, default=0):
     """Safely convert a value to float, returning default on failure."""
     try:
@@ -48,32 +103,100 @@ def safe_float(value, default=0):
         return default
 
 
+def get_allowed_invoice_discount(profile, percentage=0, amount=0):
+    """Validate invoice discounts and ignore client overrides when disabled."""
+    if not getattr(profile, "allow_discount_change", 0):
+        return 0, 0
+
+    percentage = safe_float(percentage)
+    amount = safe_float(amount)
+    if not 0 <= percentage <= 100:
+        frappe.throw(_("Invoice discount percentage must be between 0 and 100."))
+    if amount < 0:
+        frappe.throw(_("Invoice discount amount cannot be negative."))
+    return percentage, amount
+
+
 def build_item_dict(item_data, profile):
     """Build a POS Invoice Item dict from request data and POS Profile.
 
     Supports all POS Invoice Item fields including discount_amount,
     item_tax_template, margin, description, project, etc.
     """
+    allow_rate_change = bool(getattr(profile, "allow_rate_change", 0))
+    allow_discount_change = bool(getattr(profile, "allow_discount_change", 0))
+    submitted_rate = safe_float(item_data.get("rate")) if allow_rate_change else 0
+    price_list_rate = (
+        safe_float(item_data.get("price_list_rate"), submitted_rate)
+        if allow_rate_change
+        else 0
+    )
+    discount_percentage = (
+        safe_float(item_data.get("discount_percentage"))
+        if allow_discount_change
+        else 0
+    )
+    discount_amount = (
+        safe_float(item_data.get("discount_amount"))
+        if allow_discount_change
+        else 0
+    )
+
+    if not 0 <= discount_percentage <= 100:
+        frappe.throw(_("Item discount percentage must be between 0 and 100."))
+    if discount_amount < 0:
+        frappe.throw(_("Item discount amount cannot be negative."))
+
+    effective_rate = submitted_rate
+    engine_discount_percentage = discount_percentage
+    if allow_rate_change:
+        # ERPNext treats ``rate`` as the final per-unit rate; merely attaching a
+        # discount field does not reduce totals. POS clients submit the original
+        # unit rate, so derive the effective rate and preserve the list rate.
+        if discount_percentage:
+            effective_rate = price_list_rate * (1 - discount_percentage / 100)
+        elif discount_amount:
+            effective_rate = price_list_rate - discount_amount
+
+        if effective_rate < -0.000001:
+            frappe.throw(_("Item discount cannot exceed the item rate."))
+
+        # ERPNext treats a zero rate as missing during set_missing_values(). A
+        # full flat discount needs the equivalent 100% marker to remain zero.
+        if (
+            not engine_discount_percentage
+            and discount_amount
+            and price_list_rate > 0
+            and abs(effective_rate) <= 0.000001
+        ):
+            engine_discount_percentage = 100
+
     item_dict = {
         "item_code": item_data.get("item_code"),
         "qty": item_data.get("qty", 1),
-        "rate": item_data.get("rate", 0),
-        "discount_percentage": item_data.get("discount_percentage", 0),
         "warehouse": item_data.get("warehouse") or profile.warehouse,
         "income_account": item_data.get("income_account") or profile.income_account,
         "cost_center": item_data.get("cost_center") or profile.cost_center,
     }
 
+    # When rate changes are disabled, leave pricing to ERPNext instead of
+    # trusting a client-supplied rate or list rate.
+    if allow_rate_change:
+        item_dict["price_list_rate"] = price_list_rate
+        item_dict["rate"] = max(effective_rate, 0)
+    if allow_discount_change:
+        item_dict["discount_percentage"] = engine_discount_percentage
+
     # Flat discount amount (alternative to percentage)
-    if item_data.get("discount_amount"):
-        item_dict["discount_amount"] = item_data["discount_amount"]
+    if allow_rate_change and allow_discount_change and discount_amount:
+        item_dict["discount_amount"] = discount_amount
 
     # Item tax template
     if item_data.get("item_tax_template"):
         item_dict["item_tax_template"] = item_data["item_tax_template"]
 
     # Margin
-    if item_data.get("margin_type"):
+    if allow_rate_change and item_data.get("margin_type"):
         item_dict["margin_type"] = item_data["margin_type"]
         item_dict["margin_rate_or_amount"] = item_data.get("margin_rate_or_amount", 0)
 
@@ -116,6 +239,41 @@ def build_item_dict(item_data, profile):
         item_dict["weight_uom"] = item_data["weight_uom"]
 
     return item_dict
+
+
+def apply_item_discount_policy(invoice, source_items, profile):
+    """Apply flat discounts to rate-locked rows using ERPNext-resolved prices."""
+    if not getattr(profile, "allow_discount_change", 0) or getattr(
+        profile, "allow_rate_change", 0
+    ):
+        return
+
+    paid_items = [
+        item
+        for item in (invoice.get("items") or [])
+        if not getattr(item, "is_free_item", 0)
+    ]
+    for index, item_data in enumerate(source_items):
+        discount_percentage = safe_float(item_data.get("discount_percentage"))
+        discount_amount = safe_float(item_data.get("discount_amount"))
+        if discount_percentage or not discount_amount:
+            continue
+        if index >= len(paid_items):
+            frappe.throw(_("Unable to apply the item discount to the priced row."))
+
+        item = paid_items[index]
+        price_list_rate = flt(item.get("price_list_rate"))
+        if price_list_rate <= 0:
+            price_list_rate = flt(item.get("rate"))
+        if discount_amount > price_list_rate + 0.000001:
+            frappe.throw(_("Item discount cannot exceed the item rate."))
+
+        item.price_list_rate = price_list_rate
+        item.rate = max(price_list_rate - discount_amount, 0)
+        item.discount_amount = discount_amount
+        item.discount_percentage = (
+            discount_amount * 100 / price_list_rate if price_list_rate else 0
+        )
 
 
 def set_invoice_optional_fields(invoice, profile, **kwargs):
@@ -246,25 +404,46 @@ def validate_bundle_stock(item_code, qty, warehouse):
     if not components:
         return  # Not a bundle, nothing to validate
 
-    # Batch fetch actual_qty for all components in one query
-    comp_codes = [c.item_code for c in components]
+    # Service/non-stock components do not require a Bin row.
+    comp_codes = [c.item_code for c in components if flt(c.qty) > 0]
+    stock_items = {
+        row.name
+        for row in frappe.get_all(
+            "Item",
+            filters={"name": ["in", comp_codes], "is_stock_item": 1},
+            fields=["name"],
+        )
+    }
+    if not stock_items:
+        return
+
     bin_data = {
         r.item_code: r.actual_qty
         for r in frappe.get_all(
             "Bin",
-            filters={"item_code": ["in", comp_codes], "warehouse": warehouse},
+            filters={"item_code": ["in", list(stock_items)], "warehouse": warehouse},
             fields=["item_code", "actual_qty"],
         )
     }
 
     for comp in components:
-        required_qty = comp.qty * qty
-        actual_qty = bin_data.get(comp.item_code, 0) or 0
-        if required_qty > actual_qty:
+        if comp.item_code not in stock_items or flt(comp.qty) <= 0:
+            continue
+
+        from erpnext.stock.stock_ledger import is_negative_stock_allowed
+
+        if is_negative_stock_allowed(item_code=comp.item_code):
+            continue
+
+        required_qty = flt(comp.qty) * flt(qty)
+        available_qty = flt(bin_data.get(comp.item_code, 0)) - get_pos_reserved_qty(
+            comp.item_code, warehouse
+        )
+        if required_qty > available_qty:
             frappe.throw(
                 "Product Bundle {0}: Component {1} has insufficient stock. "
                 "Available: {2}, Required: {3}".format(
-                    item_code, comp.item_code, actual_qty, required_qty
+                    item_code, comp.item_code, available_qty, required_qty
                 )
             )
 
@@ -289,7 +468,7 @@ def get_bundle_availability(item_code, warehouse):
         )
     }
 
-    # Batch fetch actual_qty for all stock components in one query
+    # Batch fetch actual_qty for all stock components in one query.
     bin_data = {
         r.item_code: r.actual_qty
         for r in frappe.get_all(
@@ -305,11 +484,168 @@ def get_bundle_availability(item_code, warehouse):
             continue
         if comp.item_code not in stock_items:
             continue
-        actual_qty = bin_data.get(comp.item_code, 0) or 0
-        possible = actual_qty // comp.qty
+        from erpnext.stock.stock_ledger import is_negative_stock_allowed
+
+        if is_negative_stock_allowed(item_code=comp.item_code):
+            continue
+
+        available_qty = flt(bin_data.get(comp.item_code, 0)) - get_pos_reserved_qty(
+            comp.item_code, warehouse
+        )
+        possible = max(available_qty, 0) // flt(comp.qty)
         min_bundles = min(min_bundles, possible)
 
-    return int(min_bundles) if min_bundles != float("inf") else 0
+    # A bundle containing only service items is not stock constrained.
+    return int(min_bundles) if min_bundles != float("inf") else 1000000
+
+
+def get_pos_reserved_qty(item_code, warehouse):
+    """Return submitted, unconsolidated POS reservations for an item.
+
+    Product Bundle components live in ``Packed Item`` rather than
+    ``POS Invoice Item``; both tables must be counted to prevent overselling.
+    """
+    if not item_code or not warehouse:
+        return 0
+
+    result = frappe.db.sql(
+        """
+        SELECT COALESCE(SUM(reserved.qty), 0)
+        FROM (
+            SELECT COALESCE(SUM(item.stock_qty), 0) AS qty
+            FROM `tabPOS Invoice Item` item
+            INNER JOIN `tabPOS Invoice` invoice ON invoice.name = item.parent
+            WHERE item.docstatus = 1
+              AND item.item_code = %(item_code)s
+              AND item.warehouse = %(warehouse)s
+              AND IFNULL(invoice.consolidated_invoice, '') = ''
+            UNION ALL
+            SELECT COALESCE(SUM(packed.qty), 0) AS qty
+            FROM `tabPacked Item` packed
+            INNER JOIN `tabPOS Invoice` invoice ON invoice.name = packed.parent
+            WHERE packed.docstatus = 1
+              AND packed.item_code = %(item_code)s
+              AND packed.warehouse = %(warehouse)s
+              AND IFNULL(invoice.consolidated_invoice, '') = ''
+        ) reserved
+        """,
+        {"item_code": item_code, "warehouse": warehouse},
+    )
+    return flt(result[0][0]) if result else 0
+
+
+def get_invoice_total(invoice):
+    """Return the payable total using the document's rounding preference."""
+    return flt(invoice.rounded_total or invoice.grand_total)
+
+
+def set_pos_paid_amount(invoice):
+    """Rebuild paid_amount using ERPNext's payment-plus-loyalty semantics."""
+    conversion_rate = flt(invoice.get("conversion_rate")) or 1
+    paid_amount = sum(flt(row.amount) for row in invoice.get("payments") or [])
+    base_paid_amount = sum(
+        flt(row.amount) * conversion_rate for row in invoice.get("payments") or []
+    )
+    if invoice.get("redeem_loyalty_points") and flt(invoice.get("loyalty_amount")):
+        base_paid_amount += flt(invoice.loyalty_amount)
+        paid_amount += flt(invoice.loyalty_amount) / conversion_rate
+
+    invoice.paid_amount = flt(paid_amount)
+    invoice.base_paid_amount = flt(base_paid_amount)
+
+
+def set_pos_change_amount(invoice):
+    """Set change from over-tender after all supplemental settlement is known."""
+    if invoice.get("is_return"):
+        return
+    total = get_invoice_total(invoice)
+    settled = (
+        flt(invoice.get("paid_amount"))
+        + flt(invoice.get("total_advance"))
+        + flt(invoice.get("write_off_amount"))
+    )
+    invoice.change_amount = max(settled - total, 0)
+    invoice.base_change_amount = flt(invoice.change_amount) * (
+        flt(invoice.get("conversion_rate")) or 1
+    )
+
+
+def get_remaining_invoice_amount(invoice):
+    """Return the amount still available for credit/loyalty/write-off settlement."""
+    total = get_invoice_total(invoice)
+    # ERPNext includes loyalty_amount in paid_amount during totals calculation.
+    paid_applied = max(flt(invoice.paid_amount) - flt(invoice.change_amount), 0)
+    supplemental = (
+        max(flt(invoice.get("total_advance")), 0)
+        + max(flt(invoice.get("write_off_amount")), 0)
+    )
+    return max(total - paid_applied - supplemental, 0)
+
+
+def validate_supplemental_settlement(invoice):
+    """Reject negative or over-applied non-cash settlement amounts."""
+    if invoice.get("is_return"):
+        return
+
+    store_credit = flt(invoice.get("total_advance"))
+    loyalty_amount = flt(invoice.get("loyalty_amount"))
+    write_off_amount = flt(invoice.get("write_off_amount"))
+    amounts = {
+        _("Store credit"): store_credit,
+        _("Loyalty redemption"): loyalty_amount,
+        _("Write-off"): write_off_amount,
+    }
+    for label, amount in amounts.items():
+        if amount < 0:
+            frappe.throw(_("{0} cannot be negative.").format(label))
+
+    # paid_amount already contains loyalty_amount in ERPNext v15.
+    supplemental = store_credit + write_off_amount
+    if not supplemental:
+        return
+
+    total = get_invoice_total(invoice)
+    paid_applied = max(flt(invoice.paid_amount) - flt(invoice.change_amount), 0)
+    if paid_applied + supplemental > total + 0.005:
+        frappe.throw(
+            _("Payments, loyalty, store credit, and write-off exceed the invoice total.")
+        )
+
+
+def configure_pos_settlement(invoice):
+    """Teach POS full-payment validation about advances and write-offs."""
+    supplemental = (
+        flt(invoice.get("total_advance"))
+        + flt(invoice.get("write_off_amount"))
+    )
+    has_loyalty = invoice.get("redeem_loyalty_points") and flt(
+        invoice.get("loyalty_amount")
+    )
+    if (not supplemental and not has_loyalty) or invoice.get("is_return"):
+        return
+
+    original_validate_full_payment = invoice.validate_full_payment
+
+    def validate_full_payment():
+        # SalesInvoice.before_save rebuilds paid_amount from payment rows. Put
+        # loyalty back exactly once before POS validation on insert/submit.
+        set_pos_paid_amount(invoice)
+        partial_payment_allowed = frappe.db.get_value(
+            "POS Profile", invoice.pos_profile, "allow_partial_payment"
+        )
+        if supplemental and invoice.docstatus == 1 and not partial_payment_allowed:
+            effective_paid = (
+                flt(invoice.paid_amount)
+                - flt(invoice.change_amount)
+                + flt(invoice.get("total_advance"))
+                + flt(invoice.get("write_off_amount"))
+            )
+            if effective_paid + 0.005 < get_invoice_total(invoice):
+                frappe.throw(_("Partial Payment in POS Invoice is not allowed."))
+            return
+        original_validate_full_payment()
+
+    invoice.validate_full_payment = validate_full_payment
 
 
 def format_invoice_response(invoice):
@@ -483,6 +819,7 @@ def format_invoice_item(item):
         "rate": item.rate,
         "amount": item.amount,
         "price_list_rate": item.get("price_list_rate"),
+        "pricing_rules": item.get("pricing_rules"),
         "base_rate": item.get("base_rate"),
         "base_amount": item.get("base_amount"),
         "net_rate": item.get("net_rate"),

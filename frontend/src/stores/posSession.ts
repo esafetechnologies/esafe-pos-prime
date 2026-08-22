@@ -15,6 +15,23 @@ export const usePosSessionStore = defineStore('posSession', () => {
 
   const hasOpenShift = computed(() => isOpen.value && !!openingEntry.value)
 
+  async function resetClientState() {
+    const [cart, customer, payment, drafts, items, settings] = await Promise.all([
+      import('@/stores/cart'),
+      import('@/stores/customer'),
+      import('@/stores/payment'),
+      import('@/stores/drafts'),
+      import('@/stores/items'),
+      import('@/stores/settings'),
+    ])
+    cart.useCartStore().$reset()
+    customer.useCustomerStore().$reset()
+    payment.usePaymentStore().$reset()
+    drafts.useDraftsStore().$reset()
+    items.useItemsStore().$reset()
+    settings.useSettingsStore().$reset()
+  }
+
   // Update desk page-head indicator with opened POS profile
   watch(posProfile, (name) => {
     if (name && typeof window.posPageSetProfile === 'function') {
@@ -34,10 +51,16 @@ export const usePosSessionStore = defineStore('posSession', () => {
       )
       const openVouchers = Array.isArray(data) ? data : []
       if (openVouchers.length > 0) {
+        if (openingEntry.value && openingEntry.value !== openVouchers[0].name) {
+          await resetClientState()
+        }
         openingEntry.value = openVouchers[0].name
         posProfile.value = openVouchers[0].pos_profile
         company.value = openVouchers[0].company
         isOpen.value = true
+      } else if (openingEntry.value) {
+        await resetClientState()
+        $reset()
       }
       return openVouchers
     } finally {
@@ -61,6 +84,7 @@ export const usePosSessionStore = defineStore('posSession', () => {
         }
       )
       if (data.name) {
+        if (openingEntry.value !== data.name) await resetClientState()
         openingEntry.value = data.name
         posProfile.value = args.pos_profile
         company.value = args.company
@@ -82,6 +106,7 @@ export const usePosSessionStore = defineStore('posSession', () => {
         opening_entry: openingEntry.value,
         closing_amounts: closingAmounts,
       })
+      await resetClientState()
       $reset()
       return data
     } finally {

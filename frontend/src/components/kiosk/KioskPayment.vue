@@ -7,6 +7,7 @@ import { useCartStore } from '@/stores/cart'
 const props = defineProps<{
   formatCurrency: (value: number) => string
   cashAvailable: boolean
+  cardAvailable: boolean
   error: string | null
 }>()
 
@@ -68,6 +69,7 @@ const cartStore = useCartStore()
       <div class="space-y-4">
         <!-- Pay by Card -->
         <button
+          v-if="cardAvailable"
           class="flex w-full items-center gap-5 rounded-2xl p-6 text-left transition-transform active:scale-[0.97]"
           style="background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%); box-shadow: 0 4px 24px rgba(37,99,235,0.3);"
           @click="emit('pay-card')"

@@ -8,6 +8,7 @@ import { usePaymentStore } from '@/stores/payment'
 import { useCustomerStore } from '@/stores/customer'
 import { usePosSessionStore } from '@/stores/posSession'
 import { useSettingsStore } from '@/stores/settings'
+import { useDraftsStore } from '@/stores/drafts'
 import { useCurrency } from '@/composables/useCurrency'
 import { useTouchDevice } from '@/composables/useTouchDevice'
 import { X, Check, Banknote, CreditCard, Wallet, Coins, Award, Eraser, Delete, Loader2, AlertTriangle, BadgeDollarSign } from 'lucide-vue-next'
@@ -19,6 +20,7 @@ const paymentStore = usePaymentStore()
 const customerStore = useCustomerStore()
 const sessionStore = usePosSessionStore()
 const settingsStore = useSettingsStore()
+const draftsStore = useDraftsStore()
 const { formatCurrency } = useCurrency()
 
 const error = ref('')
@@ -47,11 +49,26 @@ const storeCreditAppliedAmount = computed(() => {
   return Math.min(storeCreditAmount.value, customerStore.storeCredit, cartStore.roundedTotal)
 })
 
+const loyaltyPointCap = computed(() => {
+  const cf = customerStore.loyaltyData?.conversion_factor || 0
+  if (cf <= 0) return 0
+  const invoiceLimit = Math.max(0, cartStore.roundedTotal - storeCreditAppliedAmount.value)
+  const configuredLimit = customerStore.maxRedeemableAmount > 0
+    ? customerStore.maxRedeemableAmount
+    : invoiceLimit
+  const amountLimit = Math.min(invoiceLimit, configuredLimit)
+  return Math.max(0, Math.min(customerStore.loyaltyPoints, Math.floor(amountLimit / cf)))
+})
+
+let settingLoyaltyPoints = false
+
 // Auto-populate and apply loyalty points when checkbox is toggled on
 watch(redeemLoyalty, (on) => {
   if (on && customerStore.loyaltyPoints > 0) {
-    loyaltyPointsToRedeem.value = customerStore.loyaltyPoints
+    settingLoyaltyPoints = true
+    loyaltyPointsToRedeem.value = loyaltyPointCap.value
     loyaltyApplied.value = true
+    settingLoyaltyPoints = false
   } else if (!on) {
     loyaltyPointsToRedeem.value = 0
     loyaltyApplied.value = false
@@ -59,26 +76,37 @@ watch(redeemLoyalty, (on) => {
 })
 
 // Reset applied state only when user manually changes the points value
-watch(loyaltyPointsToRedeem, (newVal, oldVal) => {
-  // Skip reset when auto-populated by the checkbox toggle
-  if (oldVal === 0 && newVal === customerStore.loyaltyPoints) return
+watch(loyaltyPointsToRedeem, (newVal) => {
+  if (settingLoyaltyPoints) return
+  const clamped = Math.max(0, Math.min(Math.floor(newVal || 0), loyaltyPointCap.value))
+  if (clamped !== newVal) {
+    settingLoyaltyPoints = true
+    loyaltyPointsToRedeem.value = clamped
+    settingLoyaltyPoints = false
+  }
   loyaltyApplied.value = false
-})
+}, { flush: 'sync' })
+
+watch(loyaltyPointCap, (cap) => {
+  if (loyaltyPointsToRedeem.value <= cap) return
+  settingLoyaltyPoints = true
+  loyaltyPointsToRedeem.value = cap
+  settingLoyaltyPoints = false
+}, { flush: 'sync' })
 
 const loyaltyRedemptionAmount = computed(() => {
   if (!loyaltyApplied.value || !redeemLoyalty.value || loyaltyPointsToRedeem.value <= 0) return 0
   const cf = customerStore.loyaltyData?.conversion_factor || 0
   return Math.min(
     loyaltyPointsToRedeem.value * cf,
-    cartStore.roundedTotal
+    customerStore.maxRedeemableAmount > 0 ? customerStore.maxRedeemableAmount : Infinity,
+    Math.max(0, cartStore.roundedTotal - storeCreditAppliedAmount.value)
   )
 })
 
 function applyLoyaltyPoints() {
   if (loyaltyPointsToRedeem.value <= 0) return
-  if (loyaltyPointsToRedeem.value > customerStore.loyaltyPoints) {
-    loyaltyPointsToRedeem.value = customerStore.loyaltyPoints
-  }
+  loyaltyPointsToRedeem.value = Math.min(loyaltyPointsToRedeem.value, loyaltyPointCap.value)
   loyaltyApplied.value = true
 }
 
@@ -87,12 +115,35 @@ const remainingCreditLimit = computed(() => {
   return Math.max(0, customerStore.creditLimit - customerStore.outstanding)
 })
 
-onMounted(() => {
-  paymentStore.initializePayments(
-    settingsStore.paymentMethods,
-    cartStore.roundedTotal,
-    settingsStore.disableGrandTotalToDefaultMop
-  )
+const initializingPayments = ref(true)
+let autoTenderMethod: string | null = null
+let lastAutoTenderAmount: number | null = null
+
+onMounted(async () => {
+  await cartStore.flushTaxCalculation()
+  const hasSavedTender = paymentStore.payments.some((payment) => payment.amount > 0)
+  if (!draftsStore.activeDraftName || !hasSavedTender) {
+    paymentStore.initializePayments(
+      settingsStore.paymentMethods,
+      cartStore.roundedTotal,
+      settingsStore.disableGrandTotalToDefaultMop
+    )
+  } else if (!paymentStore.activePaymentMethod) {
+    paymentStore.setActivePaymentMethod(
+      paymentStore.payments.find((payment) => payment.amount > 0)?.mode_of_payment
+        || paymentStore.payments[0]?.mode_of_payment
+      || settingsStore.defaultPaymentMethod
+    )
+  }
+  const positivePayments = paymentStore.payments.filter((payment) => payment.amount > 0)
+  const autoFilledPayment = positivePayments.length === 1
+    && !settingsStore.disableGrandTotalToDefaultMop
+    && Math.abs(positivePayments[0].amount - cartStore.roundedTotal) <= 0.005
+      ? positivePayments[0]
+      : null
+  autoTenderMethod = autoFilledPayment?.mode_of_payment ?? null
+  lastAutoTenderAmount = autoFilledPayment?.amount ?? null
+  initializingPayments.value = false
 })
 
 function onEscapeKey(e: KeyboardEvent) {
@@ -128,10 +179,34 @@ const effectiveGrandTotal = computed(() => {
   return Math.max(0, total)
 })
 
+watch([storeCreditAppliedAmount, loyaltyRedemptionAmount], () => {
+  if (initializingPayments.value || !autoTenderMethod || lastAutoTenderAmount === null) return
+  const autoPayment = paymentStore.payments.find(
+    (p) => p.mode_of_payment === autoTenderMethod
+  )
+  if (!autoPayment || Math.abs(autoPayment.amount - lastAutoTenderAmount) > 0.005) {
+    autoTenderMethod = null
+    lastAutoTenderAmount = null
+    return
+  }
+  const newTender = Math.max(
+    0,
+    Math.round((cartStore.roundedTotal - storeCreditAppliedAmount.value - loyaltyRedemptionAmount.value) * 100) / 100
+  )
+  paymentStore.setPaymentAmount(autoPayment.mode_of_payment, newTender)
+  lastAutoTenderAmount = newTender
+})
+
 const change = computed(() => Math.round(Math.max(0, paymentStore.totalPaid - effectiveGrandTotal.value) * 100) / 100)
 const remaining = computed(() => Math.round(Math.max(0, effectiveGrandTotal.value - paymentStore.totalPaid) * 100) / 100)
 const possibleWriteOff = computed(() => {
-  const baseRemaining = Math.max(0, cartStore.roundedTotal - loyaltyRedemptionAmount.value - paymentStore.totalPaid)
+  const baseRemaining = Math.max(
+    0,
+    cartStore.roundedTotal
+      - storeCreditAppliedAmount.value
+      - loyaltyRedemptionAmount.value
+      - paymentStore.totalPaid
+  )
   if (baseRemaining > 0 && baseRemaining <= settingsStore.writeOffLimit) return baseRemaining
   return 0
 })
@@ -155,7 +230,8 @@ const wouldExceedCreditLimit = computed(() => {
 })
 
 const canSubmit = computed(() => {
-  if (paymentStore.submitting) return false
+  if (paymentStore.submitting || draftsStore.loading || initializingPayments.value) return false
+  if (cartStore.taxCalculating || cartStore.taxCalculationPending || cartStore.error) return false
   if (wouldExceedCreditLimit.value && isPartialPayment.value) return false
   if (settingsStore.allowPartialPayment) return true
   return paymentStore.totalPaid >= effectiveGrandTotal.value
@@ -188,6 +264,10 @@ function getMethodIcon(mode: string) {
   if (lower.includes('card') || lower.includes('credit') || lower.includes('debit')) return CreditCard
   if (lower.includes('coin') || lower.includes('token')) return Coins
   return Wallet
+}
+
+function paymentAmount(mode: string) {
+  return paymentStore.payments.find((payment) => payment.mode_of_payment === mode)?.amount || 0
 }
 
 function selectMethod(mode: string) {
@@ -253,6 +333,12 @@ function handleSubmit() {
 }
 
 async function doSubmit() {
+  if (paymentStore.submitting || draftsStore.loading) return
+  const selectedCustomer = customerStore.customer
+  if (!selectedCustomer) {
+    error.value = __('Please select a customer')
+    return
+  }
   showPartialConfirm.value = false
   error.value = ''
   errorMessages.value = []
@@ -265,9 +351,10 @@ async function doSubmit() {
     const itemsPayload = cartStore.items.filter((i) => !i.is_free_item).map((item) => ({
       item_code: item.item_code,
       qty: item.qty,
-      rate: item.rate,
-      discount_percentage: item.discount_percentage,
-      discount_amount: item.discount_amount || undefined,
+      rate: item.pricing_rules ? (item.price_list_rate ?? item.rate) : item.rate,
+      price_list_rate: item.price_list_rate ?? item.rate,
+      discount_percentage: item.pricing_rules ? 0 : item.discount_percentage,
+      discount_amount: item.pricing_rules ? undefined : (item.discount_amount || undefined),
       serial_no: item.serial_no || undefined,
       batch_no: item.batch_no || undefined,
       serial_and_batch_bundle: item.serial_and_batch_bundle || undefined,
@@ -284,8 +371,8 @@ async function doSubmit() {
 
     const opts = cartStore.invoiceOptions || {}
 
-    const invoice = await paymentStore.submitInvoice({
-      customer: customerStore.customer.name,
+    const invoiceArgs = {
+      customer: selectedCustomer.name,
       pos_profile: sessionStore.posProfile,
       items: itemsPayload,
       payments: activePayments,
@@ -298,7 +385,7 @@ async function doSubmit() {
         : cartStore.additionalDiscountAmount || undefined,
       apply_discount_on: cartStore.applyDiscountOn,
       coupon_code: cartStore.couponCode || undefined,
-      ...(redeemLoyalty.value && loyaltyPointsToRedeem.value > 0 && customerStore.loyaltyData
+      ...(redeemLoyalty.value && loyaltyApplied.value && loyaltyPointsToRedeem.value > 0 && customerStore.loyaltyData
         ? {
             redeem_loyalty_points: true,
             loyalty_points: loyaltyPointsToRedeem.value,
@@ -312,8 +399,15 @@ async function doSubmit() {
       ...Object.fromEntries(
         Object.entries(opts).filter(([_, v]) => v != null && v !== '' && v !== false)
       ),
-    })
+    }
+    const invoice = draftsStore.activeDraftName
+      ? await draftsStore.submitDraft({
+          ...invoiceArgs,
+          invoice_name: draftsStore.activeDraftName,
+        })
+      : await paymentStore.submitInvoice(invoiceArgs)
     if (invoice) {
+      if (!paymentStore.lastInvoice) paymentStore.recordInvoice(invoice)
       paymentStore.closePaymentDialog()
     }
   } catch (e: any) {
@@ -449,10 +543,10 @@ const numpadKeys = ['1','2','3','4','5','6','7','8','9','.','0','DEL']
                 {{ pm.mode_of_payment }}
                 <!-- Amount badge -->
                 <span
-                  v-if="paymentStore.payments.find(p => p.mode_of_payment === pm.mode_of_payment)?.amount > 0 && paymentStore.activePaymentMethod !== pm.mode_of_payment"
+                  v-if="paymentAmount(pm.mode_of_payment) > 0 && paymentStore.activePaymentMethod !== pm.mode_of_payment"
                   class="ml-0.5 px-1.5 py-0.5 bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-400 rounded-md text-[10px] font-bold"
                 >
-                  {{ formatCurrency(paymentStore.payments.find(p => p.mode_of_payment === pm.mode_of_payment)?.amount ?? 0) }}
+                  {{ formatCurrency(paymentAmount(pm.mode_of_payment)) }}
                 </span>
               </button>
             </div>
@@ -595,7 +689,7 @@ const numpadKeys = ['1','2','3','4','5','6','7','8','9','.','0','DEL']
                     v-model.number="loyaltyPointsToRedeem"
                     type="number"
                     :min="0"
-                    :max="customerStore.loyaltyPoints"
+                    :max="loyaltyPointCap"
                     class="flex-1 rounded-lg border border-violet-200 dark:border-violet-700 px-2.5 py-1.5 text-xs text-right focus:outline-none focus:ring-2 focus:ring-violet-400 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100"
                   />
                   <button
@@ -644,7 +738,7 @@ const numpadKeys = ['1','2','3','4','5','6','7','8','9','.','0','DEL']
             </div>
 
             <!-- Payment Summary -->
-            <div v-if="paymentStore.payments.filter(p => p.amount > 0).length > 1 || storeCreditAppliedAmount > 0" class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3 space-y-1.5">
+            <div v-if="paymentStore.payments.filter(p => p.amount > 0).length > 1 || storeCreditAppliedAmount > 0 || loyaltyRedemptionAmount > 0" class="bg-gray-50 dark:bg-gray-800 rounded-xl p-3 space-y-1.5">
               <div class="text-[10px] text-gray-400 dark:text-gray-500 uppercase tracking-wider font-semibold mb-1">{{ __('Payment Summary') }}</div>
               <div
                 v-for="pm in paymentStore.payments.filter(p => p.amount > 0)"
@@ -664,9 +758,16 @@ const numpadKeys = ['1','2','3','4','5','6','7','8','9','.','0','DEL']
                 </span>
                 <span class="font-semibold text-emerald-700 dark:text-emerald-300">{{ formatCurrency(storeCreditAppliedAmount) }}</span>
               </div>
+              <div v-if="loyaltyRedemptionAmount > 0" class="flex items-center justify-between text-xs">
+                <span class="text-violet-600 dark:text-violet-400 flex items-center gap-1.5">
+                  <Award :size="12" />
+                  {{ __('Loyalty') }}
+                </span>
+                <span class="font-semibold text-violet-700 dark:text-violet-300">{{ formatCurrency(loyaltyRedemptionAmount) }}</span>
+              </div>
               <div class="border-t border-gray-200 dark:border-gray-700 pt-1.5 flex items-center justify-between text-xs font-bold">
                 <span class="text-gray-700 dark:text-gray-300">{{ __('Total Paid') }}</span>
-                <span class="text-blue-600 dark:text-blue-400">{{ formatCurrency(paymentStore.totalPaid + storeCreditAppliedAmount) }}</span>
+                <span class="text-blue-600 dark:text-blue-400">{{ formatCurrency(paymentStore.totalPaid + storeCreditAppliedAmount + loyaltyRedemptionAmount) }}</span>
               </div>
             </div>
 
@@ -704,9 +805,9 @@ const numpadKeys = ['1','2','3','4','5','6','7','8','9','.','0','DEL']
                 : 'bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 cursor-not-allowed'
               "
             >
-              <Loader2 v-if="paymentStore.submitting" :size="18" class="animate-spin" />
+              <Loader2 v-if="paymentStore.submitting || draftsStore.loading || initializingPayments" :size="18" class="animate-spin" />
               <Check v-else :size="18" />
-              {{ paymentStore.submitting ? __('Processing...') : __('Complete Payment') }}
+              {{ paymentStore.submitting || draftsStore.loading || initializingPayments ? __('Processing...') : __('Complete Payment') }}
             </button>
           </div>
         </div>

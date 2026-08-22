@@ -4,6 +4,20 @@
 import frappe
 from frappe.utils import flt
 
+from pos_prime.api._utils import (
+    validate_doctype_permissions,
+    validate_pos_access,
+)
+
+
+def _validate_customer_read(customer):
+    validate_pos_access()
+    if not frappe.db.exists("Customer", customer):
+        return None
+    customer_doc = frappe.get_doc("Customer", customer)
+    validate_doctype_permissions("Customer", "read", doc=customer_doc)
+    return customer_doc
+
 
 @frappe.whitelist()
 def get_store_credit(customer, company):
@@ -12,11 +26,52 @@ def get_store_credit(customer, company):
     Returns individual advances (for populating the advances table on
     POS Invoice) and the total available amount.
     """
-    if not customer or not company:
+    return _get_store_credit(customer, company)
+
+
+def get_store_credit_for_update(customer, company):
+    """Return available credit while locking its source rows for allocation."""
+    return _get_store_credit(customer, company, lock=True)
+
+
+def _get_store_credit(customer, company, lock=False):
+    customer_doc = _validate_customer_read(customer)
+    if not customer_doc or not company:
         return {"advances": [], "total_advance": 0}
 
-    if not frappe.db.exists("Customer", customer):
+    if not frappe.db.exists("Company", company):
         return {"advances": [], "total_advance": 0}
+
+    if lock:
+        frappe.db.sql(
+            """
+            SELECT pe.name
+            FROM `tabPayment Entry` pe
+            WHERE pe.party_type = 'Customer'
+              AND pe.party = %(customer)s
+              AND pe.company = %(company)s
+              AND pe.payment_type = 'Receive'
+              AND pe.docstatus = 1
+              AND pe.unallocated_amount > 0
+            FOR UPDATE
+            """,
+            {"customer": customer, "company": company},
+        )
+        frappe.db.sql(
+            """
+            SELECT jea.name
+            FROM `tabJournal Entry Account` jea
+            INNER JOIN `tabJournal Entry` je ON je.name = jea.parent
+            WHERE jea.party_type = 'Customer'
+              AND jea.party = %(customer)s
+              AND je.company = %(company)s
+              AND je.docstatus = 1
+              AND jea.is_advance = 'Yes'
+              AND IFNULL(jea.reference_type, '') = ''
+            FOR UPDATE
+            """,
+            {"customer": customer, "company": company},
+        )
 
     # 1. Payment Entry advances (unallocated receipts)
     pe_advances = frappe.db.sql(
@@ -25,16 +80,29 @@ def get_store_credit(customer, company):
             'Payment Entry' as reference_type,
             pe.name as reference_name,
             '' as reference_row,
-            pe.unallocated_amount as amount,
+            (pe.unallocated_amount - IFNULL(pos_alloc.total_allocated, 0)) as amount,
+            pe.paid_from as account,
+            pe.source_exchange_rate as ref_exchange_rate,
             pe.remarks,
             pe.posting_date
         FROM `tabPayment Entry` pe
+        LEFT JOIN (
+            SELECT reference_name, SUM(allocated_amount) AS total_allocated
+            FROM `tabSales Invoice Advance` advance_row
+            INNER JOIN `tabPOS Invoice` pos_invoice
+                ON pos_invoice.name = advance_row.parent
+                AND advance_row.parenttype = 'POS Invoice'
+            WHERE advance_row.reference_type = 'Payment Entry'
+              AND advance_row.docstatus = 1
+              AND IFNULL(pos_invoice.consolidated_invoice, '') = ''
+            GROUP BY advance_row.reference_name
+        ) pos_alloc ON pos_alloc.reference_name = pe.name
         WHERE pe.party_type = 'Customer'
           AND pe.party = %(customer)s
           AND pe.company = %(company)s
           AND pe.payment_type = 'Receive'
           AND pe.docstatus = 1
-          AND pe.unallocated_amount > 0
+          AND (pe.unallocated_amount - IFNULL(pos_alloc.total_allocated, 0)) > 0
         ORDER BY pe.posting_date ASC
         """,
         {"customer": customer, "company": company},
@@ -55,15 +123,24 @@ def get_store_credit(customer, company):
                 jea.name as reference_row,
                 (jea.credit_in_account_currency - jea.debit_in_account_currency
                  - IFNULL(alloc.total_allocated, 0)) as amount,
+                jea.account as account,
+                jea.exchange_rate as ref_exchange_rate,
                 je.remark as remarks,
                 je.posting_date
             FROM `tabJournal Entry Account` jea
             JOIN `tabJournal Entry` je ON je.name = jea.parent
-            LEFT JOIN (
-                SELECT reference_row, SUM(allocated_amount) as total_allocated
-                FROM `tabSales Invoice Advance`
-                WHERE reference_type = 'Journal Entry' AND docstatus = 1
-                GROUP BY reference_row
+                LEFT JOIN (
+                    SELECT advance_row.reference_row,
+                           SUM(advance_row.allocated_amount) as total_allocated
+                FROM `tabSales Invoice Advance` advance_row
+                LEFT JOIN `tabPOS Invoice` pos_invoice
+                    ON pos_invoice.name = advance_row.parent
+                    AND advance_row.parenttype = 'POS Invoice'
+                    WHERE advance_row.reference_type = 'Journal Entry'
+                      AND advance_row.docstatus = 1
+                      AND advance_row.parenttype = 'POS Invoice'
+                      AND IFNULL(pos_invoice.consolidated_invoice, '') = ''
+                GROUP BY advance_row.reference_row
             ) alloc ON alloc.reference_row = jea.name
             WHERE jea.party_type = 'Customer'
               AND jea.party = %(customer)s
@@ -71,6 +148,7 @@ def get_store_credit(customer, company):
               AND jea.account = %(receivable_account)s
               AND je.docstatus = 1
               AND jea.is_advance = 'Yes'
+              AND IFNULL(jea.reference_type, '') = ''
               AND (jea.credit_in_account_currency - jea.debit_in_account_currency
                    - IFNULL(alloc.total_allocated, 0)) > 0
             ORDER BY je.posting_date ASC
@@ -98,16 +176,16 @@ def get_customer_pos_invoices(customer, company="", limit=10):
 
     If company is provided, only returns invoices from that company.
     """
-    if not frappe.db.exists("Customer", customer):
+    if not _validate_customer_read(customer):
         return []
 
-    limit = min(int(limit), 50)
+    limit = max(1, min(int(limit), 50))
 
     filters = {"customer": customer, "docstatus": 1}
     if company:
         filters["company"] = company
 
-    invoices = frappe.get_all(
+    invoices = frappe.get_list(
         "POS Invoice",
         filters=filters,
         fields=[
@@ -127,50 +205,41 @@ def get_customer_outstanding(customer, company=""):
     If company is provided, only calculates outstanding from that company's
     invoices and returns the credit limit for that company.
     """
-    if not frappe.db.exists("Customer", customer):
+    customer_doc = _validate_customer_read(customer)
+    if not customer_doc:
         return {"outstanding": 0, "credit_limit": 0}
 
-    # Outstanding from unpaid Sales Invoices + POS Invoices
-    params = {"customer": customer}
-    company_filter = ""
+    # Use permission-aware document queries; raw SQL here would bypass Company
+    # user permissions and could disclose accounting balances.
+    validate_doctype_permissions("Sales Invoice", "read")
+    invoice_filters = {"customer": customer, "docstatus": 1}
     if company:
-        company_filter = "AND company = %(company)s"
-        params["company"] = company
+        invoice_filters["company"] = company
 
-    result = frappe.db.sql(
-        f"""
-        SELECT COALESCE(SUM(outstanding_amount), 0) as outstanding
-        FROM (
-            SELECT outstanding_amount FROM `tabSales Invoice`
-            WHERE customer = %(customer)s AND docstatus = 1
-                AND outstanding_amount > 0 {company_filter}
-            UNION ALL
-            SELECT outstanding_amount FROM `tabPOS Invoice`
-            WHERE customer = %(customer)s AND docstatus = 1
-                AND outstanding_amount > 0
-                AND IFNULL(consolidated_invoice, '') = ''
-                {company_filter}
-        ) combined
-        """,
-        params,
-        as_dict=True,
+    sales_outstanding = frappe.get_list(
+        "Sales Invoice",
+        filters=invoice_filters,
+        pluck="outstanding_amount",
+        limit_page_length=0,
     )
-    outstanding = result[0].outstanding if result else 0
+    pos_filters = dict(invoice_filters)
+    pos_filters["consolidated_invoice"] = ["is", "not set"]
+    pos_outstanding = frappe.get_list(
+        "POS Invoice",
+        filters=pos_filters,
+        pluck="outstanding_amount",
+        limit_page_length=0,
+    )
+    outstanding = sum(flt(value) for value in sales_outstanding + pos_outstanding)
 
     # Credit limit from Customer Credit Limit child table
     credit_limit = 0
-    credit_filters = {"parent": customer, "parenttype": "Customer"}
-    if company:
-        credit_filters["company"] = company
-
-    credit_limits = frappe.get_all(
-        "Customer Credit Limit",
-        filters=credit_filters,
-        fields=["credit_limit"],
-        limit=1,
-    )
-    if credit_limits:
-        credit_limit = credit_limits[0].credit_limit or 0
+    credit_limits = customer_doc.get("credit_limits") or []
+    matching_limits = [
+        row for row in credit_limits if not company or row.company == company
+    ]
+    if matching_limits:
+        credit_limit = flt(matching_limits[0].credit_limit)
 
     return {
         "outstanding": outstanding,

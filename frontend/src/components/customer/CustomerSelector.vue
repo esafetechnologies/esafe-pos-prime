@@ -6,6 +6,7 @@ import { ref, watch, onUnmounted, nextTick } from 'vue'
 import { call } from 'frappe-ui'
 import { useCustomerStore } from '@/stores/customer'
 import { usePosSessionStore } from '@/stores/posSession'
+import { useCartStore } from '@/stores/cart'
 import { useCurrency } from '@/composables/useCurrency'
 import { User, X, Plus, Search, Phone, Tag, AlertTriangle, ChevronRight, Loader2, ChevronDown } from 'lucide-vue-next'
 
@@ -17,6 +18,7 @@ const emit = defineEmits<{
 
 const customerStore = useCustomerStore()
 const sessionStore = usePosSessionStore()
+const cartStore = useCartStore()
 const searchTerm = ref('')
 const results = ref<{ name: string; customer_name: string; mobile_no?: string; email_id?: string }[]>([])
 const showDropdown = ref(false)
@@ -57,8 +59,9 @@ async function selectCustomer(name: string) {
   showDropdown.value = false
 }
 
-function clearCustomer() {
+async function clearCustomer() {
   customerStore.$reset()
+  await cartStore.flushTaxCalculation()
 }
 
 async function openQuickEntry() {
@@ -156,6 +159,7 @@ function isExtraField(fieldname: string) {
       <button
         @click="emit('openDetail')"
         class="flex items-center gap-3 flex-1 min-w-0 text-left cursor-pointer"
+        :aria-label="__('Selected customer')"
       >
         <!-- Circular avatar (ERPNext-style) -->
         <div class="w-10 h-10 rounded-full flex items-center justify-center shrink-0 bg-gray-100 dark:bg-gray-800">

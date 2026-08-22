@@ -3,25 +3,84 @@
 
 import frappe
 from frappe import _
-from frappe.utils import nowdate, nowtime
+from frappe.utils import flt, nowdate, nowtime
 import json
 import erpnext
-from pos_prime.api._utils import validate_pos_access
+from pos_prime.api._utils import (
+    is_pos_manager,
+    validate_doctype_permissions,
+    validate_pos_access,
+    validate_pos_document_access,
+)
+
+
+def _erpnext_major_version():
+    try:
+        return int(erpnext.__version__.split(".")[0])
+    except (AttributeError, TypeError, ValueError):
+        return 15
+
+
+def _build_payment_summary(opening, closing_entry):
+    """Normalize v15/v16 reconciliation rows to opening + sales totals."""
+    opening_amounts = {}
+    mode_order = []
+    for detail in opening.balance_details:
+        mode = detail.mode_of_payment
+        if mode not in opening_amounts:
+            mode_order.append(mode)
+            opening_amounts[mode] = 0
+        opening_amounts[mode] += flt(detail.opening_amount)
+
+    sales_amounts = {mode: 0 for mode in mode_order}
+    is_v16 = _erpnext_major_version() >= 16
+    for row in closing_entry.payment_reconciliation:
+        mode = row.mode_of_payment
+        if mode not in mode_order:
+            mode_order.append(mode)
+            opening_amounts[mode] = flt(row.get("opening_amount"))
+            sales_amounts[mode] = 0
+
+        if is_v16:
+            sales_amounts[mode] += flt(row.expected_amount)
+        else:
+            row_opening = opening_amounts.get(mode, flt(row.get("opening_amount")))
+            sales_amounts[mode] += flt(row.expected_amount) - row_opening
+
+    return [
+        {
+            "mode_of_payment": mode,
+            "opening_amount": flt(opening_amounts.get(mode)),
+            "sales_amount": flt(sales_amounts.get(mode)),
+            "expected_amount": flt(opening_amounts.get(mode))
+            + flt(sales_amounts.get(mode)),
+        }
+        for mode in mode_order
+    ]
+
+
+def _validate_opening_access(opening, permissions="read"):
+    validate_pos_document_access(
+        opening,
+        permissions=permissions,
+        owner_field="user",
+    )
 
 
 @frappe.whitelist()
 def get_opening_data():
     """Get data needed for opening a POS shift."""
-    validate_pos_access()
+    validate_pos_access(permissions="read", doctype="POS Opening Entry")
     user = frappe.session.user
 
     # Check for existing open entry
-    existing = frappe.db.get_value(
+    existing_entries = frappe.get_list(
         "POS Opening Entry",
-        {"user": user, "status": "Open", "docstatus": 1},
-        ["name", "pos_profile", "company"],
-        as_dict=True,
+        filters={"user": user, "status": "Open", "docstatus": 1},
+        fields=["name", "pos_profile", "company"],
+        limit_page_length=1,
     )
+    existing = existing_entries[0] if existing_entries else None
 
     # Get available POS Profiles
     profiles = frappe.get_list(
@@ -29,6 +88,22 @@ def get_opening_data():
         filters={"disabled": 0},
         fields=["name", "company"],
     )
+    profiles = [
+        profile
+        for profile in profiles
+        if not frappe.db.exists(
+            "POS Profile User",
+            {"parent": profile.name, "parenttype": "POS Profile"},
+        )
+        or frappe.db.exists(
+            "POS Profile User",
+            {
+                "parent": profile.name,
+                "parenttype": "POS Profile",
+                "user": user,
+            },
+        )
+    ]
 
     return {
         "opening_entry": existing,
@@ -43,43 +118,14 @@ def get_shift_summary(opening_entry):
     Uses ERPNext's built-in make_closing_entry_from_opening to get
     accurate invoice data with proper timestamp range filtering.
     """
-    validate_pos_access()
     from erpnext.accounts.doctype.pos_closing_entry.pos_closing_entry import (
         make_closing_entry_from_opening,
     )
 
     opening = frappe.get_doc("POS Opening Entry", opening_entry)
+    _validate_opening_access(opening)
     closing_entry = make_closing_entry_from_opening(opening)
-
-    # Build opening amounts lookup from the opening entry itself
-    # (v16 doesn't prepend opening amounts into payment_reconciliation)
-    opening_amounts = {
-        d.mode_of_payment: d.opening_amount or 0
-        for d in opening.balance_details
-    }
-
-    payment_summary = []
-    for pr in closing_entry.payment_reconciliation:
-        row_opening = getattr(pr, "opening_amount", None)
-        if row_opening:
-            # v14/v15: opening_amount is prepopulated on the row,
-            # and expected_amount = opening + sales
-            opening_amt = row_opening
-            sales_amt = (pr.expected_amount or 0) - opening_amt
-        else:
-            # v16: opening_amount is 0 on the row,
-            # and expected_amount = sales only (opening not included)
-            opening_amt = opening_amounts.get(pr.mode_of_payment, 0)
-            sales_amt = pr.expected_amount or 0
-
-        payment_summary.append(
-            {
-                "mode_of_payment": pr.mode_of_payment,
-                "opening_amount": opening_amt,
-                "sales_amount": sales_amt,
-                "expected_amount": opening_amt + sales_amt,
-            }
-        )
+    payment_summary = _build_payment_summary(opening, closing_entry)
 
     # v14/v15 use pos_transactions, v16 uses pos_invoices
     transactions = (
@@ -100,9 +146,14 @@ def get_shift_summary(opening_entry):
 @frappe.whitelist()
 def check_opening_entry(user=""):
     """Check if user has an open POS Opening Entry."""
-    validate_pos_access()
+    validate_pos_access(permissions="read", doctype="POS Opening Entry")
     user = user or frappe.session.user
-    entries = frappe.get_all(
+    if user != frappe.session.user and not is_pos_manager():
+        frappe.throw(
+            _("You can only check your own POS opening entry."),
+            frappe.PermissionError,
+        )
+    entries = frappe.get_list(
         "POS Opening Entry",
         filters={"user": user, "docstatus": 1, "status": "Open"},
         fields=["name", "pos_profile", "company"],
@@ -113,9 +164,23 @@ def check_opening_entry(user=""):
 @frappe.whitelist()
 def create_opening_entry(pos_profile, company, balance_details):
     """Create a new POS Opening Entry."""
-    validate_pos_access(pos_profile)
+    validate_pos_access(
+        pos_profile,
+        permissions=("create", "submit"),
+        doctype="POS Opening Entry",
+    )
     if isinstance(balance_details, str):
         balance_details = json.loads(balance_details)
+    if not isinstance(balance_details, list):
+        frappe.throw(_("Opening balances must be a list."))
+
+    profile_company = frappe.db.get_value("POS Profile", pos_profile, "company")
+    if company != profile_company:
+        frappe.throw(_("Company must match the selected POS Profile."))
+
+    profile = frappe.get_doc("POS Profile", pos_profile)
+    allowed_modes = {row.mode_of_payment for row in profile.payments}
+    seen_modes = set()
 
     doc = frappe.get_doc({
         "doctype": "POS Opening Entry",
@@ -125,11 +190,22 @@ def create_opening_entry(pos_profile, company, balance_details):
         "period_start_date": nowdate() + " " + nowtime(),
     })
     for detail in balance_details:
+        mode_of_payment = detail.get("mode_of_payment")
+        opening_amount = flt(detail.get("opening_amount"))
+        if (
+            not mode_of_payment
+            or mode_of_payment in seen_modes
+            or mode_of_payment not in allowed_modes
+        ):
+            frappe.throw(_("Opening balances contain an invalid payment mode."))
+        if opening_amount < 0:
+            frappe.throw(_("Opening amount cannot be negative."))
+        seen_modes.add(mode_of_payment)
         doc.append("balance_details", {
-            "mode_of_payment": detail.get("mode_of_payment"),
-            "opening_amount": detail.get("opening_amount", 0),
+            "mode_of_payment": mode_of_payment,
+            "opening_amount": opening_amount,
         })
-    doc.insert(ignore_permissions=True)
+    doc.insert()
     doc.submit()
     return doc.as_dict()
 
@@ -137,7 +213,7 @@ def create_opening_entry(pos_profile, company, balance_details):
 @frappe.whitelist()
 def get_pos_profile(pos_profile):
     """Get full POS Profile document with company default currency."""
-    validate_pos_access(pos_profile)
+    validate_pos_access(pos_profile, permissions="read", doctype="POS Profile")
     doc = frappe.get_doc("POS Profile", pos_profile)
     result = doc.as_dict()
     if not result.get("currency") and result.get("company"):
@@ -174,6 +250,8 @@ def get_branding(company=""):
     company_abbr = ""
     company_name = ""
     if company:
+        company_doc = frappe.get_doc("Company", company)
+        validate_doctype_permissions("Company", "read", doc=company_doc)
         comp_data = frappe.db.get_value(
             "Company", company, ["company_logo", "abbr", "company_name"], as_dict=True
         )
@@ -195,33 +273,26 @@ def get_branding(company=""):
 def get_invoice_option_lists():
     """Get dropdown options for Invoice Options panel.
 
-    Returns lists of Sales Partners, Projects, Shipping Rules,
-    Terms and Conditions, and Payment Terms Templates.
-    Uses frappe.get_all with ignore_permissions so non-admin POS users
-    don't need direct read access to these doctypes.
+    Returns only the option lists the current user is allowed to read.
     """
     validate_pos_access()
+    def permitted_list(doctype, filters=None, limit=50):
+        if not frappe.has_permission(doctype, ptype="read"):
+            return []
+        return frappe.get_list(
+            doctype,
+            filters=filters,
+            fields=["name"],
+            limit_page_length=limit,
+            order_by="name asc",
+        )
+
     return {
-        "sales_partners": frappe.get_all(
-            "Sales Partner", fields=["name"], limit_page_length=100,
-            ignore_permissions=True, order_by="name asc",
-        ),
-        "projects": frappe.get_all(
-            "Project", filters={"status": "Open"}, fields=["name"],
-            limit_page_length=100, ignore_permissions=True, order_by="name asc",
-        ),
-        "shipping_rules": frappe.get_all(
-            "Shipping Rule", fields=["name"], limit_page_length=50,
-            ignore_permissions=True, order_by="name asc",
-        ),
-        "terms_and_conditions": frappe.get_all(
-            "Terms and Conditions", fields=["name"], limit_page_length=50,
-            ignore_permissions=True, order_by="name asc",
-        ),
-        "payment_terms_templates": frappe.get_all(
-            "Payment Terms Template", fields=["name"], limit_page_length=50,
-            ignore_permissions=True, order_by="name asc",
-        ),
+        "sales_partners": permitted_list("Sales Partner", limit=100),
+        "projects": permitted_list("Project", {"status": "Open"}, limit=100),
+        "shipping_rules": permitted_list("Shipping Rule"),
+        "terms_and_conditions": permitted_list("Terms and Conditions"),
+        "payment_terms_templates": permitted_list("Payment Terms Template"),
     }
 
 
@@ -248,17 +319,14 @@ def get_opening_entry_detail(entry_name):
 
     Returns essential fields without requiring direct doctype read permission.
     """
-    validate_pos_access()
     if not frappe.db.exists("POS Opening Entry", entry_name):
         frappe.throw(_("POS Opening Entry {0} does not exist").format(entry_name))
-
-    data = frappe.db.get_value(
-        "POS Opening Entry",
-        entry_name,
-        ["name", "docstatus", "status", "pos_profile", "company", "user"],
-        as_dict=True,
-    )
-    return data
+    opening = frappe.get_doc("POS Opening Entry", entry_name)
+    _validate_opening_access(opening)
+    return {
+        field: opening.get(field)
+        for field in ("name", "docstatus", "status", "pos_profile", "company", "user")
+    }
 
 
 @frappe.whitelist()
@@ -268,7 +336,6 @@ def close_shift(opening_entry, closing_amounts=None):
     Uses make_closing_entry_from_opening which correctly fetches invoices
     by timestamp range, user, pos_profile, and excludes already-consolidated ones.
     """
-    validate_pos_access()
     from erpnext.accounts.doctype.pos_closing_entry.pos_closing_entry import (
         make_closing_entry_from_opening,
     )
@@ -281,6 +348,11 @@ def close_shift(opening_entry, closing_amounts=None):
         frappe.throw(_("Opening entry {0} does not exist").format(opening_entry))
 
     opening = frappe.get_doc("POS Opening Entry", opening_entry)
+    _validate_opening_access(opening)
+    validate_doctype_permissions(
+        "POS Closing Entry",
+        permissions=("create", "submit"),
+    )
 
     # If opening entry is already closed, check if a closing entry exists
     # (handles retries after partial failures like scheduler being inactive)
@@ -291,39 +363,58 @@ def close_shift(opening_entry, closing_amounts=None):
             "name",
         )
         if existing_closing:
-            return {"name": existing_closing, "status": "Closed"}
+            closing_status = frappe.db.get_value(
+                "POS Closing Entry", existing_closing, "status"
+            )
+            return {"name": existing_closing, "status": closing_status}
         frappe.throw(_("Opening entry {0} is not open or not submitted").format(opening_entry))
 
     # Use ERPNext's built-in function to build the closing entry
     closing = make_closing_entry_from_opening(opening)
 
+    payment_summary = _build_payment_summary(opening, closing)
+
     # Apply user-provided closing amounts
     closing_lookup = {}
     if closing_amounts:
         for ca in closing_amounts:
-            closing_lookup[ca.get("mode_of_payment")] = ca.get("closing_amount", 0)
+            mode = ca.get("mode_of_payment")
+            if not mode or mode in closing_lookup:
+                frappe.throw(_("Closing amounts contain a missing or duplicate payment mode."))
+            amount = flt(ca.get("closing_amount"))
+            if amount < 0:
+                frappe.throw(_("Closing amount cannot be negative."))
+            closing_lookup[mode] = amount
 
-    for pr in closing.payment_reconciliation:
-        closing_amount = closing_lookup.get(pr.mode_of_payment, 0)
-        pr.closing_amount = closing_amount
-        pr.difference = closing_amount - (pr.expected_amount or 0)
+    expected_modes = {row["mode_of_payment"] for row in payment_summary}
+    unknown_modes = set(closing_lookup) - expected_modes
+    if unknown_modes:
+        frappe.throw(
+            _("Unknown payment mode(s): {0}").format(", ".join(sorted(unknown_modes)))
+        )
+
+    # ERPNext v16's server helper omits the opening rows that its Desk client
+    # normally prepends. Rebuild the table so physical closing cash is compared
+    # with opening cash plus the shift's net payments on every supported version.
+    closing.set("payment_reconciliation", [])
+    for summary in payment_summary:
+        closing_amount = closing_lookup.get(summary["mode_of_payment"], 0)
+        closing.append(
+            "payment_reconciliation",
+            {
+                "mode_of_payment": summary["mode_of_payment"],
+                "opening_amount": summary["opening_amount"],
+                "expected_amount": summary["expected_amount"],
+                "closing_amount": closing_amount,
+                "difference": flt(closing_amount - summary["expected_amount"]),
+            },
+        )
 
     closing.posting_date = nowdate()
     closing.posting_time = nowtime()
 
-    closing.insert(ignore_permissions=True)
+    closing.insert()
+    closing.submit()
+    closing.reload()
 
-    try:
-        closing.submit()
-    except Exception:
-        # submit() saves the doc before on_submit hooks run, so the closing
-        # entry may already be submitted even if a hook (e.g. invoice
-        # consolidation / scheduler check) fails. Reload and check.
-        closing.reload()
-        if closing.docstatus == 1:
-            # Shift closed successfully — the hook error is non-fatal
-            frappe.clear_messages()
-            return {"name": closing.name, "status": "Closed"}
-        raise
-
-    return {"name": closing.name, "status": "Closed"}
+    return {"name": closing.name, "status": closing.status}

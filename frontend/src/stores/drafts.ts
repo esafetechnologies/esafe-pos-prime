@@ -50,6 +50,7 @@ export const useDraftsStore = defineStore('drafts', () => {
     pos_profile: string
     items: { item_code: string; qty: number; rate: number; discount_percentage?: number; [key: string]: any }[]
     payments?: { mode_of_payment: string; amount: number }[]
+    [key: string]: any
   }) {
     loading.value = true
     try {
@@ -96,6 +97,7 @@ export const useDraftsStore = defineStore('drafts', () => {
     additional_discount_percentage?: number
     discount_amount?: number
     coupon_code?: string
+    [key: string]: any
   }) {
     loading.value = true
     try {

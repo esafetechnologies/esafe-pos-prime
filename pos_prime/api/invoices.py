@@ -7,6 +7,7 @@ from frappe.utils import flt
 import json
 
 from pos_prime.api._utils import (
+    apply_item_discount_policy,
     build_item_dict,
     set_invoice_optional_fields,
     format_invoice_response,
@@ -15,6 +16,12 @@ from pos_prime.api._utils import (
     get_product_bundle_items,
     validate_bundle_stock,
     set_campaign_from_profile,
+    configure_pos_settlement,
+    get_allowed_invoice_discount,
+    get_remaining_invoice_amount,
+    set_pos_change_amount,
+    set_pos_paid_amount,
+    validate_supplemental_settlement,
 )
 
 
@@ -86,7 +93,11 @@ def create_pos_invoice(
     Supports ALL POS Invoice fields for complete parity with ERPNext's built-in POS.
     """
     # Permission check
-    validate_pos_access(pos_profile)
+    validate_pos_access(
+        pos_profile,
+        permissions=("create", "submit"),
+        doctype="POS Invoice",
+    )
 
     if isinstance(items, str):
         items = json.loads(items)
@@ -99,7 +110,12 @@ def create_pos_invoice(
     if not items:
         frappe.throw(_("Items cannot be empty"))
 
+    payments = payments or []
+
     profile = frappe.get_doc("POS Profile", pos_profile)
+    additional_discount_percentage, discount_amount = get_allowed_invoice_discount(
+        profile, additional_discount_percentage, discount_amount
+    )
 
     if not payments and not getattr(profile, "allow_partial_payment", 0) and not flt(store_credit_amount) and not (redeem_loyalty_points and flt(loyalty_points)):
         frappe.throw(_("Payments cannot be empty"))
@@ -116,8 +132,7 @@ def create_pos_invoice(
             or frappe.defaults.get_defaults().get("currency", "USD"),
             "set_warehouse": profile.warehouse,
             "update_stock": getattr(profile, "update_stock", 0),
-            "account_for_change_amount": profile.account_for_change_amount
-            or profile.write_off_account,
+            "account_for_change_amount": profile.account_for_change_amount,
             "write_off_account": profile.write_off_account,
             "write_off_cost_center": profile.write_off_cost_center,
             "apply_discount_on": apply_discount_on or profile.apply_discount_on or "Grand Total",
@@ -268,41 +283,32 @@ def create_pos_invoice(
                     )
                 )
 
-    # Store credit via advance Payment Entries
+    # Store credit is allocated after totals and all other settlement amounts
+    # are known. A negative request is never meaningful.
     store_credit = flt(store_credit_amount)
-    credit_data = None
-    if store_credit > 0:
-        from pos_prime.api.customer_profile import get_store_credit
+    if store_credit < 0:
+        frappe.throw(_("Store credit cannot be negative."))
 
-        credit_data = get_store_credit(customer, profile.company)
-        available = flt(credit_data.get("total_advance", 0))
-        if store_credit > available:
-            store_credit = available
-
-    invoice.flags.ignore_permissions = True
     invoice.set_missing_values()
+    apply_item_discount_policy(invoice, items, profile)
+    # set_missing_values populates accounts/item defaults but does not calculate
+    # the transaction total. Store-credit caps must use the final taxed total.
+    invoice.calculate_taxes_and_totals()
+    set_pos_paid_amount(invoice)
 
-    # Cap payment row amounts so total paid does not exceed the invoice total.
-    # When a customer tenders more cash than the bill (e.g. pays 1000 for an
-    # 880 bill), the frontend shows the change but the backend should record
-    # only the net amount.  Without this cap, ERPNext's POS Closing Entry
-    # get_payments() may fail to subtract change_amount (due to
-    # account_for_change_amount vs payment-account mismatch), inflating the
-    # expected cash and showing a false shortage.
-    if not is_return and flt(invoice.change_amount) > 0:
-        excess = flt(invoice.change_amount)
-        for p in reversed(invoice.payments):
-            if excess <= 0:
-                break
-            reduction = min(excess, flt(p.amount))
-            p.amount = flt(p.amount - reduction)
-            excess -= reduction
+    # Lock the source receipts before calculating availability. Submitted
+    # advance child rows are the reservation ledger; cancellation automatically
+    # releases them because only docstatus=1 allocations are counted.
+    credit_data = None
+    if store_credit > 0 and not is_return:
+        from pos_prime.api.customer_profile import get_store_credit_for_update
 
-    # Now grand_total is calculated — cap store credit and allocate advances FIFO
-    if store_credit > 0 and credit_data:
-        invoice_total = flt(invoice.rounded_total or invoice.grand_total)
-        if invoice_total > 0:
-            store_credit = min(store_credit, invoice_total)
+        credit_data = get_store_credit_for_update(customer, profile.company)
+        store_credit = min(
+            store_credit,
+            flt(credit_data.get("total_advance", 0)),
+            get_remaining_invoice_amount(invoice),
+        )
 
         remaining = store_credit
         for adv in credit_data.get("advances", []):
@@ -318,65 +324,19 @@ def create_pos_invoice(
                 "advance_amount": flt(adv.amount),
                 "allocated_amount": alloc,
                 "remarks": adv.get("remarks", ""),
+                "account": adv.get("account"),
+                "ref_exchange_rate": flt(adv.get("ref_exchange_rate")) or 1,
+                "difference_posting_date": invoice.posting_date,
             })
             remaining -= alloc
 
         invoice.total_advance = flt(store_credit - remaining)
 
-    # Override POS validation to account for advance payments
-    if flt(invoice.total_advance) > 0:
-        _orig_validate_full = invoice.validate_full_payment
-
-        def _patched_validate_full():
-            effective_paid = flt(invoice.paid_amount) + flt(invoice.total_advance)
-            target = flt(invoice.rounded_total or invoice.grand_total)
-            if effective_paid >= target:
-                return
-            _orig_validate_full()
-
-        invoice.validate_full_payment = _patched_validate_full
-
-        def _patched_set_outstanding():
-            invoice.outstanding_amount = max(
-                0,
-                flt(invoice.rounded_total or invoice.grand_total)
-                - flt(invoice.paid_amount)
-                - flt(invoice.total_advance)
-                + flt(invoice.change_amount)
-                + flt(invoice.write_off_amount),
-            )
-
-        invoice.set_outstanding_amount = _patched_set_outstanding
-
-    # When "Validate Stock on Save" is unchecked, bypass ERPNext's
-    # validate_stock_availablility() which runs on both insert and submit.
-    if not profile.validate_stock_on_save:
-        invoice.validate_stock_availablility = lambda: None
+    set_pos_change_amount(invoice)
+    validate_supplemental_settlement(invoice)
+    configure_pos_settlement(invoice)
 
     invoice.insert()
     invoice.submit()
-
-    # Allocate advances — reduce unallocated_amount to prevent double-spend
-    # Payment Entries: reduce unallocated_amount directly
-    # Journal Entries: tracked via the advances child table (allocation subquery)
-    if flt(invoice.total_advance) > 0:
-        for adv_row in invoice.advances:
-            allocated = flt(adv_row.allocated_amount)
-            if allocated <= 0:
-                continue
-            if adv_row.reference_type == "Payment Entry":
-                pe_unallocated = flt(
-                    frappe.db.get_value(
-                        "Payment Entry", adv_row.reference_name, "unallocated_amount"
-                    )
-                )
-                new_unallocated = max(0, pe_unallocated - allocated)
-                frappe.db.set_value(
-                    "Payment Entry",
-                    adv_row.reference_name,
-                    "unallocated_amount",
-                    new_unallocated,
-                    update_modified=False,
-                )
 
     return format_invoice_response(invoice)

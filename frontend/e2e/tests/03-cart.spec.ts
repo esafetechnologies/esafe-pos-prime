@@ -1,6 +1,10 @@
 import { test, expect } from '../fixtures/pos-fixtures'
 import { POSPage } from '../fixtures/pos-page'
 
+function currencyValue(value: string): number {
+  return Number(value.replace(/[^0-9.-]/g, ''))
+}
+
 test.describe('Cart Operations', () => {
   let pos: POSPage
 
@@ -125,5 +129,52 @@ test.describe('Cart Operations', () => {
 
     const qty = await pos.getTotalQty()
     expect(qty).toContain('2')
+  })
+
+  test('should keep item percentage discount totals in sync', async ({ testData }) => {
+    await pos.addItemBySearch(testData.items.nonStock)
+    await pos.increaseQty(0)
+    await pos.waitForTaxCalculation()
+
+    const originalNet = currencyValue(await pos.getNetTotal())
+    await pos.applyItemDiscount(0, 'percentage', 10)
+    const expected = originalNet * 0.9
+
+    expect(currencyValue(await pos.getNetTotal())).toBeCloseTo(expected, 2)
+    expect(currencyValue(await pos.getCartTotal())).toBeCloseTo(expected, 2)
+    expect(currencyValue(await pos.getCheckoutTotal())).toBeCloseTo(expected, 2)
+  })
+
+  test('should apply flat item discount per unit and clear it when switching modes', async ({ testData }) => {
+    await pos.addItemBySearch(testData.items.nonStock)
+    await pos.increaseQty(0)
+    await pos.waitForTaxCalculation()
+
+    const originalNet = currencyValue(await pos.getNetTotal())
+    await pos.applyItemDiscount(0, 'amount', 15)
+    const flatExpected = originalNet - 30
+    expect(currencyValue(await pos.getNetTotal())).toBeCloseTo(flatExpected, 2)
+    expect(currencyValue(await pos.getCartTotal())).toBeCloseTo(flatExpected, 2)
+    expect(currencyValue(await pos.getCheckoutTotal())).toBeCloseTo(flatExpected, 2)
+
+    await pos.applyItemDiscount(0, 'percentage', 10)
+    const percentExpected = originalNet * 0.9
+    expect(currencyValue(await pos.getNetTotal())).toBeCloseTo(percentExpected, 2)
+    expect(currencyValue(await pos.getCartTotal())).toBeCloseTo(percentExpected, 2)
+    expect(currencyValue(await pos.getCheckoutTotal())).toBeCloseTo(percentExpected, 2)
+  })
+
+  test('should show zero in every payable total after a full flat item discount', async ({ testData }) => {
+    await pos.addItemBySearch(testData.items.nonStock)
+    await pos.waitForTaxCalculation()
+
+    const unitPrice = currencyValue(await pos.getNetTotal())
+    expect(unitPrice).toBeGreaterThan(0)
+
+    await pos.applyItemDiscount(0, 'amount', unitPrice)
+
+    expect(currencyValue(await pos.getNetTotal())).toBeCloseTo(0, 2)
+    expect(currencyValue(await pos.getCartTotal())).toBeCloseTo(0, 2)
+    expect(currencyValue(await pos.getCheckoutTotal())).toBeCloseTo(0, 2)
   })
 })

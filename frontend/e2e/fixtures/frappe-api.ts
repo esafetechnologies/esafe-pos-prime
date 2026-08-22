@@ -14,13 +14,22 @@ export class FrappeAPI {
   }
 
   async login(user = 'Administrator', password = 'admin'): Promise<void> {
-    const resp = await this.request.post(`${this.baseURL}/api/method/login`, {
-      form: { usr: user, pwd: password },
-    })
-    if (!resp.ok()) {
-      throw new Error(`Login failed: ${resp.status()} ${await resp.text()}`)
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const resp = await this.request.post(`${this.baseURL}/api/method/login`, {
+        form: { usr: user, pwd: password },
+      })
+      if (resp.ok()) return
+
+      const body = await resp.text()
+      const retryable = resp.status() >= 500 && (
+        body.includes('QueryDeadlockError') ||
+        body.includes('Record has changed since last read')
+      )
+      if (!retryable || attempt === 3) {
+        throw new Error(`Login failed: ${resp.status()} ${body}`)
+      }
+      await new Promise(resolve => setTimeout(resolve, attempt * 500))
     }
-    // Playwright's request context automatically stores cookies from the response
   }
 
   async call(method: string, args: Record<string, any> = {}): Promise<any> {

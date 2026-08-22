@@ -36,6 +36,7 @@ export const useCartStore = defineStore('cart', () => {
 
   // Tax calculation state
   const taxCalculating = ref(false)
+  const taxCalculationPending = ref(false)
   const error = ref<string | null>(null)
   let taxDebounceTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -65,60 +66,80 @@ export const useCartStore = defineStore('cart', () => {
     items.value.reduce((sum, item) => sum + item.qty, 0)
   )
 
-  function addItem(item: Item, validateStock = true): string | null {
+  function addItem(
+    item: Item,
+    validateStock = true,
+    options: {
+      uom?: string
+      conversionFactor?: number
+      batchNo?: string | null
+      serialNo?: string | null
+    } = {}
+  ): string | null {
     // Stock validation: check available qty for stock items
     if (validateStock && item.is_stock_item) {
       const available = item.actual_qty ?? 0
       // Sum qty already in cart for this item
       const cartQty = items.value
         .filter((i) => i.item_code === item.item_code)
-        .reduce((sum, i) => sum + i.qty, 0)
-      if (cartQty >= available) {
+        .reduce((sum, i) => sum + i.qty * (i.conversion_factor || 1), 0)
+      if (cartQty + (options.conversionFactor || 1) > available) {
         return __('Not enough stock. Available: {0}', [String(available)])
       }
     }
 
     // For batch/serial items, don't merge — they get separate lines
     if (item.has_batch_no || item.has_serial_no) {
-      items.value.push(createCartItem(item))
+      items.value.push(createCartItem(item, options))
       selectedItemIndex.value = items.value.length - 1
       debounceTaxCalculation()
       return null
     }
 
     const existingIndex = items.value.findIndex(
-      (i) => i.item_code === item.item_code && !i.batch_no && !i.serial_no
+      (i) => i.item_code === item.item_code
+        && !i.batch_no
+        && !i.serial_no
+        && i.uom === (options.uom || item.stock_uom)
     )
     if (existingIndex >= 0) {
       items.value[existingIndex].qty += 1
       recalcItemAmount(existingIndex)
       selectedItemIndex.value = existingIndex
     } else {
-      items.value.push(createCartItem(item))
+      items.value.push(createCartItem(item, options))
       selectedItemIndex.value = items.value.length - 1
     }
     debounceTaxCalculation()
     return null
   }
 
-  function createCartItem(item: Item): CartItem {
+  function createCartItem(
+    item: Item,
+    options: {
+      uom?: string
+      conversionFactor?: number
+      batchNo?: string | null
+      serialNo?: string | null
+    } = {}
+  ): CartItem {
     return {
       item_code: item.item_code,
       item_name: item.item_name,
       rate: item.rate,
       qty: 1,
       amount: item.rate,
-      uom: item.stock_uom,
+      uom: options.uom || item.stock_uom,
       discount_percentage: 0,
       discount_amount: 0,
       image: item.image,
       stock_uom: item.stock_uom,
       has_serial_no: item.has_serial_no,
       has_batch_no: item.has_batch_no,
-      serial_no: null,
-      batch_no: null,
+      serial_no: options.serialNo || null,
+      batch_no: options.batchNo || null,
       serial_and_batch_bundle: null,
-      conversion_factor: 1,
+      conversion_factor: options.conversionFactor || 1,
       item_tax_template: item.item_tax_template || null,
       margin_type: null,
       margin_rate_or_amount: 0,
@@ -126,6 +147,8 @@ export const useCartStore = defineStore('cart', () => {
       project: null,
       weight_per_unit: item.weight_per_unit || null,
       weight_uom: item.weight_uom || null,
+      actual_qty: item.actual_qty,
+      is_stock_item: item.is_stock_item,
     }
   }
 
@@ -134,14 +157,16 @@ export const useCartStore = defineStore('cart', () => {
       removeItem(index)
       return null
     }
-    // Stock validation if available qty is provided and validation is enabled
-    if (validateStock && availableQty !== undefined && availableQty > 0) {
+    // Use the item's captured stock level when callers do not pass it explicitly.
+    const stockQty = availableQty ?? items.value[index]?.actual_qty
+    if (validateStock && items.value[index]?.is_stock_item && stockQty !== undefined) {
       const item = items.value[index]
       const otherCartQty = items.value
         .filter((i, idx) => idx !== index && i.item_code === item.item_code)
-        .reduce((sum, i) => sum + i.qty, 0)
-      if (qty + otherCartQty > availableQty) {
-        return __('Not enough stock. Available: {0}', [String(availableQty)])
+        .reduce((sum, i) => sum + i.qty * (i.conversion_factor || 1), 0)
+      const requestedStockQty = qty * (item.conversion_factor || 1) + otherCartQty
+      if (requestedStockQty > stockQty) {
+        return __('Not enough stock. Available: {0}', [String(stockQty)])
       }
     }
     items.value[index].qty = qty
@@ -157,10 +182,15 @@ export const useCartStore = defineStore('cart', () => {
   }
 
   function updateItemDiscount(index: number, discount: number) {
-    items.value[index].discount_percentage = Math.min(Math.max(discount, 0), 100)
+    const item = items.value[index]
+    if (item.pricing_rules && item.price_list_rate != null) {
+      item.rate = item.price_list_rate
+    }
+    item.discount_percentage = Math.min(Math.max(discount, 0), 100)
+    item.discount_amount = 0
     // User override clears pricing rule (server will re-evaluate)
-    items.value[index].pricing_rules = null
-    items.value[index].price_list_rate = null
+    item.pricing_rules = null
+    item.price_list_rate = null
     recalcItemAmount(index)
     debounceTaxCalculation()
   }
@@ -182,11 +212,15 @@ export const useCartStore = defineStore('cart', () => {
   }
 
   function updateItemDiscountAmount(index: number, discountAmt: number) {
-    items.value[index].discount_amount = Math.max(discountAmt, 0)
-    items.value[index].discount_percentage = 0 // clear % when using flat
+    const item = items.value[index]
+    if (item.pricing_rules && item.price_list_rate != null) {
+      item.rate = item.price_list_rate
+    }
+    item.discount_amount = Math.min(Math.max(discountAmt, 0), item.rate)
+    item.discount_percentage = 0 // clear % when using flat
     // User override clears pricing rule (server will re-evaluate)
-    items.value[index].pricing_rules = null
-    items.value[index].price_list_rate = null
+    item.pricing_rules = null
+    item.price_list_rate = null
     recalcItemAmount(index)
     debounceTaxCalculation()
   }
@@ -206,11 +240,13 @@ export const useCartStore = defineStore('cart', () => {
       // Rate is already the final discounted rate from the pricing engine;
       // discount_percentage/discount_amount are kept for display only.
       item.amount = item.qty * item.rate
-    } else if (item.discount_amount > 0) {
-      // discount_amount is total line discount (not per-unit), matching ERPNext behavior
-      item.amount = Math.max(0, item.qty * item.rate - item.discount_amount)
-    } else {
+    } else if (item.discount_percentage > 0) {
       item.amount = item.qty * item.rate * (1 - item.discount_percentage / 100)
+    } else if (item.discount_amount > 0) {
+      // ERPNext item discount_amount is per unit.
+      item.amount = item.qty * Math.max(0, item.rate - item.discount_amount)
+    } else {
+      item.amount = item.qty * item.rate
     }
     // Round to 2 decimal places to avoid floating point precision issues
     item.amount = Math.round(item.amount * 100) / 100
@@ -239,6 +275,11 @@ export const useCartStore = defineStore('cart', () => {
     debounceTaxCalculation()
   }
 
+  function setApplyDiscountOn(value: 'Grand Total' | 'Net Total') {
+    applyDiscountOn.value = value
+    debounceTaxCalculation()
+  }
+
   function setCouponCode(code: string | null) {
     couponCode.value = code
     debounceTaxCalculation()
@@ -246,14 +287,41 @@ export const useCartStore = defineStore('cart', () => {
 
   function debounceTaxCalculation() {
     if (taxDebounceTimer) clearTimeout(taxDebounceTimer)
+    taxCalculationPending.value = true
     taxDebounceTimer = setTimeout(() => {
+      taxDebounceTimer = null
       calculateTaxes()
     }, 500)
   }
 
+  async function flushTaxCalculation() {
+    if (taxDebounceTimer) {
+      clearTimeout(taxDebounceTimer)
+      taxDebounceTimer = null
+    }
+    taxCalculationPending.value = false
+    await calculateTaxes()
+  }
+
   async function calculateTaxes(posProfile?: string, customer?: string) {
+    const currentId = ++taxRequestId
+    taxCalculationPending.value = false
+    error.value = null
+    // Never send artifacts from the previous pricing response back as input.
+    // The server will re-evaluate and return the rules that still apply.
+    items.value = items.value.filter((item) => !item.is_free_item)
+    for (const item of items.value) {
+      if (!item.pricing_rules) continue
+      if (item.price_list_rate != null) item.rate = item.price_list_rate
+      item.discount_percentage = 0
+      item.discount_amount = 0
+      item.pricing_rules = null
+      item.price_list_rate = null
+      recalcItemAmount(items.value.indexOf(item))
+    }
     if (items.value.length === 0) {
       clearTaxData()
+      taxCalculating.value = false
       return
     }
 
@@ -271,10 +339,10 @@ export const useCartStore = defineStore('cart', () => {
 
     if (!profile || !cust) {
       clearTaxData()
+      taxCalculating.value = false
       return
     }
 
-    const currentId = ++taxRequestId
     taxCalculating.value = true
     try {
       const data = await call('pos_prime.api.taxes.calculate_taxes', {
@@ -284,6 +352,7 @@ export const useCartStore = defineStore('cart', () => {
           item_code: item.item_code,
           qty: item.qty,
           rate: item.rate,
+          price_list_rate: item.price_list_rate ?? item.rate,
           discount_percentage: item.discount_percentage,
           discount_amount: item.discount_amount || 0,
           serial_no: item.serial_no || '',
@@ -302,6 +371,7 @@ export const useCartStore = defineStore('cart', () => {
 
       if (currentId !== taxRequestId) return
 
+      error.value = null
       taxes.value = data.taxes || []
       serverNetTotal.value = data.net_total
       serverGrandTotal.value = data.grand_total
@@ -341,12 +411,18 @@ export const useCartStore = defineStore('cart', () => {
   }
 
   function applyPricingRuleData(
-    pricingRules: { item_code: string; pricing_rules: string; rate: number; price_list_rate: number; discount_percentage: number; discount_amount: number }[],
+    pricingRules: { item_index?: number; item_code: string; pricing_rules: string; rate: number; price_list_rate: number; discount_percentage: number; discount_amount: number }[],
     freeItems: { item_code: string; item_name: string; qty: number; rate: number; amount: number; uom: string; stock_uom: string; pricing_rules: string }[],
   ) {
-    // Clear previous pricing rule markers from non-free items
+    // Restore the pre-rule price before applying the fresh server response.
     for (const item of items.value) {
       if (!item.is_free_item) {
+        if (item.pricing_rules) {
+          if (item.price_list_rate != null) item.rate = item.price_list_rate
+          item.discount_percentage = 0
+          item.discount_amount = 0
+          recalcItemAmount(items.value.indexOf(item))
+        }
         item.pricing_rules = null
         item.price_list_rate = null
       }
@@ -356,8 +432,14 @@ export const useCartStore = defineStore('cart', () => {
     items.value = items.value.filter((i) => !i.is_free_item)
 
     // Apply pricing rule info to matching cart items
+    const paidItems = items.value.filter((item) => !item.is_free_item)
     for (const pr of pricingRules) {
-      const cartItem = items.value.find((i) => i.item_code === pr.item_code && !i.is_free_item)
+      const indexedItem = Number.isInteger(pr.item_index)
+        ? paidItems[pr.item_index as number]
+        : undefined
+      const cartItem = indexedItem?.item_code === pr.item_code
+        ? indexedItem
+        : paidItems.find((item) => item.item_code === pr.item_code)
       if (cartItem) {
         cartItem.pricing_rules = pr.pricing_rules
         cartItem.price_list_rate = pr.price_list_rate
@@ -402,6 +484,8 @@ export const useCartStore = defineStore('cart', () => {
         project: null,
         weight_per_unit: null,
         weight_uom: null,
+        actual_qty: undefined,
+        is_stock_item: false,
         is_free_item: true,
         pricing_rules: fi.pricing_rules || null,
         price_list_rate: null,
@@ -428,6 +512,7 @@ export const useCartStore = defineStore('cart', () => {
     couponCode.value = null
     invoiceOptions.value = {}
     taxCalculating.value = false
+    taxCalculationPending.value = false
     error.value = null
     if (taxDebounceTimer) {
       clearTimeout(taxDebounceTimer)
@@ -442,6 +527,7 @@ export const useCartStore = defineStore('cart', () => {
     selectedItemIndex,
     taxes,
     taxCalculating,
+    taxCalculationPending,
     discountType,
     discountValue,
     couponCode,
@@ -468,10 +554,12 @@ export const useCartStore = defineStore('cart', () => {
     removeItem,
     selectItem,
     setDiscount,
+    setApplyDiscountOn,
     setCouponCode,
     setInvoiceOptions,
     error,
     calculateTaxes,
+    flushTaxCalculation,
     $reset,
   }
 })

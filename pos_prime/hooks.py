@@ -10,6 +10,10 @@ app_license = "mit"
 
 required_apps = ["erpnext"]
 
+override_doctype_class = {
+	"POS Invoice Merge Log": "pos_prime.overrides.pos_invoice_merge_log.POSPrimePOSInvoiceMergeLog",
+}
+
 app_include_js = "/assets/pos_prime/js/pos_prime.js"
 
 add_to_apps_screen = [

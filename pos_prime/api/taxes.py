@@ -5,7 +5,13 @@ import frappe
 from frappe import _
 import json
 
-from pos_prime.api._utils import safe_float
+from pos_prime.api._utils import (
+    apply_item_discount_policy,
+    build_item_dict,
+    get_allowed_invoice_discount,
+    safe_float,
+    validate_pos_access,
+)
 
 
 @frappe.whitelist()
@@ -23,11 +29,16 @@ def calculate_taxes(
     Creates a temporary POS Invoice in memory, sets missing values,
     and runs calculate_taxes_and_totals() without saving.
     """
+    validate_pos_access(pos_profile, permissions="read", doctype="POS Invoice")
+
     try:
         if isinstance(items, str):
             items = json.loads(items)
 
         profile = frappe.get_doc("POS Profile", pos_profile)
+        additional_discount_percentage, discount_amount = get_allowed_invoice_discount(
+            profile, additional_discount_percentage, discount_amount
+        )
 
         invoice = frappe.get_doc(
             {
@@ -68,196 +79,11 @@ def calculate_taxes(
 
         # Add items with full field support
         for item_data in items:
-            item_dict = {
-                "item_code": item_data.get("item_code"),
-                "qty": item_data.get("qty", 1),
-                "rate": item_data.get("rate", 0),
-                "discount_percentage": item_data.get("discount_percentage", 0),
-                "warehouse": profile.warehouse,
-                "income_account": profile.income_account,
-                "cost_center": profile.cost_center,
-                "serial_no": item_data.get("serial_no", ""),
-                "batch_no": item_data.get("batch_no", ""),
-                "uom": item_data.get("uom", ""),
-                "conversion_factor": item_data.get("conversion_factor", 1),
-            }
-            # Flat discount amount
-            if item_data.get("discount_amount"):
-                item_dict["discount_amount"] = item_data["discount_amount"]
-            # Item tax template
-            if item_data.get("item_tax_template"):
-                item_dict["item_tax_template"] = item_data["item_tax_template"]
-            # Margin
-            if item_data.get("margin_type"):
-                item_dict["margin_type"] = item_data["margin_type"]
-                item_dict["margin_rate_or_amount"] = item_data.get("margin_rate_or_amount", 0)
-            invoice.append("items", item_dict)
+            invoice.append("items", build_item_dict(item_data, profile))
 
         # Use ERPNext's built-in tax calculation
         invoice.set_missing_values()
-
-        # Apply item-level Price discount rules.  set_missing_values()
-        # evaluates pricing rules internally but silently discards Price
-        # discount results when item fields already carry default values
-        # (0 instead of None).  Product discount rules (free items) ARE
-        # applied correctly by set_missing_values(), so we only handle
-        # Price discounts here.
-        if not profile.ignore_pricing_rule:
-            from erpnext.accounts.doctype.pricing_rule.utils import (
-                get_pricing_rules,
-            )
-
-            coupon_pricing_rule = None
-            if coupon_code and invoice.coupon_code:
-                coupon_pricing_rule = frappe.db.get_value(
-                    "Coupon Code", invoice.coupon_code, "pricing_rule"
-                )
-
-            original_count = len(invoice.items)
-            for idx in range(original_count):
-                item = invoice.items[idx]
-                if getattr(item, "is_free_item", 0):
-                    continue
-
-                item_args = frappe._dict({
-                    "doctype": "POS Invoice",
-                    "child_doctype": "POS Invoice Item",
-                    "item_code": item.item_code,
-                    "item_group": item.item_group,
-                    "brand": item.brand or "",
-                    "qty": item.qty,
-                    "stock_qty": getattr(item, "stock_qty", None) or item.qty,
-                    "rate": item.rate,
-                    "price_list_rate": item.price_list_rate or item.rate,
-                    "amount": item.qty * item.rate,
-                    "customer": invoice.customer,
-                    "customer_group": invoice.customer_group,
-                    "territory": invoice.territory,
-                    "company": invoice.company,
-                    "transaction_type": "selling",
-                    "selling": 1,
-                    "price_list": invoice.selling_price_list,
-                    "transaction_date": (
-                        getattr(invoice, "transaction_date", None)
-                        or getattr(invoice, "posting_date", None)
-                        or frappe.utils.today()
-                    ),
-                    "coupon_code": invoice.coupon_code if coupon_code else None,
-                })
-
-                all_rules = get_pricing_rules(item_args)
-                if not all_rules:
-                    continue
-
-                # Separate Price vs Product discount rules
-                price_rules = []
-                product_rules = []
-                for rule in all_rules:
-                    if not coupon_code and rule.coupon_code_based:
-                        continue
-                    if rule.min_qty and item.qty < rule.min_qty:
-                        continue
-                    if rule.min_amt and (item.qty * item.rate) < rule.min_amt:
-                        continue
-                    if rule.price_or_product_discount == "Product":
-                        product_rules.append(rule)
-                    else:
-                        price_rules.append(rule)
-
-                # --- Best Price discount ---
-                best = None
-                if coupon_code and coupon_pricing_rule:
-                    for rule in price_rules:
-                        if rule.name == coupon_pricing_rule:
-                            best = rule
-                            break
-                if not best:
-                    candidates = [r for r in price_rules if not r.coupon_code_based]
-                    if candidates:
-                        candidates.sort(key=lambda x: x.priority or 0, reverse=True)
-                        best = candidates[0]
-
-                if best:
-                    if not item.price_list_rate:
-                        item.price_list_rate = item.rate
-                    item.pricing_rules = json.dumps([best.name])
-                    if best.rate_or_discount == "Discount Percentage" and best.discount_percentage:
-                        item.discount_percentage = best.discount_percentage
-                    elif best.rate_or_discount == "Discount Amount" and best.discount_amount:
-                        item.discount_amount = best.discount_amount
-                    elif best.rate_or_discount == "Rate" and best.rate:
-                        item.price_list_rate = best.rate
-                        item.rate = best.rate
-                    if best.margin_type:
-                        item.margin_type = best.margin_type
-                        item.margin_rate_or_amount = best.margin_rate_or_amount or 0
-
-                # --- Best Product discount (free item) with dedup ---
-                # set_missing_values() may have already added free items
-                # (v15/v16), so check before adding to avoid duplicates.
-                best_product = None
-                if coupon_code and coupon_pricing_rule:
-                    for rule in product_rules:
-                        if rule.name == coupon_pricing_rule:
-                            best_product = rule
-                            break
-                if not best_product:
-                    candidates = [r for r in product_rules if not r.coupon_code_based]
-                    if candidates:
-                        candidates.sort(key=lambda x: x.priority or 0, reverse=True)
-                        best_product = candidates[0]
-
-                if best_product:
-                    free_item_code = best_product.free_item or (
-                        item.item_code if best_product.same_item else None
-                    )
-                    if free_item_code:
-                        # Check if this free item was already added
-                        already = False
-                        for it in invoice.items:
-                            if getattr(it, "is_free_item", 0):
-                                it_pr = getattr(it, "pricing_rules", "") or ""
-                                if best_product.name in it_pr:
-                                    already = True
-                                    break
-                        if not already:
-                            invoice.append("items", {
-                                "item_code": free_item_code,
-                                "qty": best_product.free_qty or 1,
-                                "rate": best_product.free_item_rate or 0,
-                                "is_free_item": 1,
-                                "pricing_rules": json.dumps([best_product.name]),
-                                "warehouse": profile.warehouse,
-                                "income_account": profile.income_account,
-                                "cost_center": profile.cost_center,
-                            })
-
-            # Coupon-based Product discount safety net.
-            # get_pricing_rules() may not return coupon_code_based rules on
-            # all ERPNext versions.  Directly check and add if missing.
-            if coupon_code and coupon_pricing_rule:
-                pr_type = frappe.db.get_value(
-                    "Pricing Rule", coupon_pricing_rule, "price_or_product_discount"
-                )
-                if pr_type == "Product":
-                    already_added = any(
-                        coupon_pricing_rule in (getattr(it, "pricing_rules", "") or "")
-                        for it in invoice.items
-                        if getattr(it, "is_free_item", 0)
-                    )
-                    if not already_added:
-                        pr_doc = frappe.get_doc("Pricing Rule", coupon_pricing_rule)
-                        if pr_doc.free_item:
-                            invoice.append("items", {
-                                "item_code": pr_doc.free_item,
-                                "qty": pr_doc.free_qty or 1,
-                                "rate": pr_doc.free_item_rate or 0,
-                                "is_free_item": 1,
-                                "pricing_rules": json.dumps([coupon_pricing_rule]),
-                                "warehouse": profile.warehouse,
-                                "income_account": profile.income_account,
-                                "cost_center": profile.cost_center,
-                            })
+        apply_item_discount_policy(invoice, items, profile)
 
         invoice.calculate_taxes_and_totals()
 
@@ -276,8 +102,18 @@ def calculate_taxes(
                 to_remove = []
                 for item in invoice.items:
                     if getattr(item, "is_free_item", 0) and getattr(item, "pricing_rules", None):
-                        pr_name = item.pricing_rules.strip('"')
-                        if frappe.db.get_value("Pricing Rule", pr_name, "coupon_code_based"):
+                        try:
+                            rule_names = json.loads(item.pricing_rules)
+                        except (TypeError, ValueError):
+                            rule_names = [str(item.pricing_rules).strip('"')]
+                        if isinstance(rule_names, str):
+                            rule_names = [rule_names]
+                        if any(
+                            frappe.db.get_value(
+                                "Pricing Rule", rule_name, "coupon_code_based"
+                            )
+                            for rule_name in rule_names
+                        ):
                             to_remove.append(item)
                 for item in to_remove:
                     invoice.remove(item)
@@ -301,6 +137,7 @@ def calculate_taxes(
         # Extract pricing rule data from items
         pricing_rules = []
         free_items = []
+        paid_item_index = 0
         for item in invoice.items:
             pr = getattr(item, "pricing_rules", None)
             is_free = getattr(item, "is_free_item", 0)
@@ -318,6 +155,7 @@ def calculate_taxes(
                 })
             elif pr and pr not in ("[]", "[\n]", "null", ""):
                 pricing_rules.append({
+                    "item_index": paid_item_index,
                     "item_code": item.item_code,
                     "pricing_rules": pr,
                     "rate": item.rate,
@@ -328,6 +166,8 @@ def calculate_taxes(
                     "margin_rate_or_amount": item.margin_rate_or_amount or 0,
                     "rate_with_margin": item.rate_with_margin or 0,
                 })
+            if not is_free:
+                paid_item_index += 1
 
         return {
             "net_total": invoice.net_total,

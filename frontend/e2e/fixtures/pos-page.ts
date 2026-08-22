@@ -169,8 +169,7 @@ export class POSPage {
   }
 
   async getSelectedCustomer(): Promise<string | null> {
-    // The customer name is in a div with text-sm font-bold truncate inside the customer button
-    const customerBtn = this.page.locator('button.flex.items-center.gap-3')
+    const customerBtn = this.page.locator('button[aria-label="Selected customer"]')
     const name = customerBtn.locator('.text-sm.font-bold.truncate').first()
     if (await name.isVisible({ timeout: 5000 }).catch(() => false)) {
       return (await name.textContent())?.trim() || null
@@ -221,6 +220,26 @@ export class POSPage {
     const input = this.page.locator('input[type="number"][step="0.01"]').last()
     await input.fill(String(value))
     await this.page.waitForTimeout(1000) // wait for tax recalculation
+  }
+
+  async applyItemDiscount(
+    itemIndex: number,
+    type: 'percentage' | 'amount',
+    value: number
+  ) {
+    await this.page.locator('[role="listitem"]').nth(itemIndex).click()
+    const mode = type === 'percentage' ? 'Disc%' : 'Disc$'
+    await this.page.getByRole('button', { name: mode, exact: true }).click()
+
+    const label = type === 'percentage' ? 'Discount %' : 'Discount Amt'
+    const editor = this.page.getByText(label, { exact: true }).locator('..')
+    await editor.locator('input[type="number"]').fill(String(value))
+    await editor.getByRole('button', { name: 'Done', exact: true }).click()
+    await this.waitForTaxCalculation()
+  }
+
+  async getCheckoutTotal(): Promise<string> {
+    return (await this.page.locator('button.checkout-btn').textContent())?.trim() || '0'
   }
 
   // ── Payment ────────────────────────────────────────────────────────────

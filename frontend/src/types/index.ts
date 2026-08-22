@@ -92,6 +92,8 @@ export interface CartItem {
   batch_no: string | null
   serial_and_batch_bundle: string | null
   conversion_factor: number
+  actual_qty?: number
+  is_stock_item?: boolean
   // Extended fields
   item_tax_template: string | null
   margin_type: string | null

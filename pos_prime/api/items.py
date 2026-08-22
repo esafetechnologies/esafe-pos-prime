@@ -2,7 +2,12 @@
 # Licensed under GPLv3. See license.txt
 
 import frappe
-from pos_prime.api._utils import get_product_bundle_items, get_bundle_availability, validate_pos_access
+from pos_prime.api._utils import (
+    get_bundle_availability,
+    get_pos_reserved_qty,
+    get_product_bundle_items,
+    validate_pos_access,
+)
 
 
 @frappe.whitelist()
@@ -20,7 +25,7 @@ def get_items(
     only items with stock > 0 in the warehouse are returned — filtered
     server-side so pagination works correctly.
     """
-    validate_pos_access(pos_profile or None)
+    validate_pos_access(pos_profile or None, permissions="read", doctype="Item")
     start = int(start)
     page_length = int(page_length)
 
@@ -74,13 +79,23 @@ def get_items(
         join_clause = (
             "LEFT JOIN `tabBin` b ON b.item_code = i.item_code AND b.warehouse = %(warehouse)s "
             "LEFT JOIN ("
-            "  SELECT pi_item.item_code, SUM(pi_item.stock_qty) as reserved_qty"
-            "  FROM `tabPOS Invoice Item` pi_item"
-            "  INNER JOIN `tabPOS Invoice` pi ON pi.name = pi_item.parent"
-            "  WHERE pi_item.docstatus = 1"
-            "    AND pi_item.warehouse = %(warehouse)s"
-            "    AND IFNULL(pi.consolidated_invoice, '') = ''"
-            "  GROUP BY pi_item.item_code"
+            "  SELECT reserved.item_code, SUM(reserved.qty) AS reserved_qty"
+            "  FROM ("
+            "    SELECT pi_item.item_code, pi_item.stock_qty AS qty"
+            "    FROM `tabPOS Invoice Item` pi_item"
+            "    INNER JOIN `tabPOS Invoice` pi ON pi.name = pi_item.parent"
+            "    WHERE pi_item.docstatus = 1"
+            "      AND pi_item.warehouse = %(warehouse)s"
+            "      AND IFNULL(pi.consolidated_invoice, '') = ''"
+            "    UNION ALL"
+            "    SELECT packed.item_code, packed.qty"
+            "    FROM `tabPacked Item` packed"
+            "    INNER JOIN `tabPOS Invoice` pi ON pi.name = packed.parent"
+            "    WHERE packed.docstatus = 1"
+            "      AND packed.warehouse = %(warehouse)s"
+            "      AND IFNULL(pi.consolidated_invoice, '') = ''"
+            "  ) reserved"
+            "  GROUP BY reserved.item_code"
             ") pos_res ON pos_res.item_code = i.item_code"
         )
         conditions.append(
@@ -174,14 +189,25 @@ def get_items(
     if warehouse:
         reserved_data = frappe.db.sql(
             """
-            SELECT pi_item.item_code, SUM(pi_item.stock_qty) as qty
-            FROM `tabPOS Invoice Item` pi_item
-            INNER JOIN `tabPOS Invoice` pi ON pi.name = pi_item.parent
-            WHERE pi_item.docstatus = 1
-              AND pi_item.item_code IN %(item_codes)s
-              AND pi_item.warehouse = %(warehouse)s
-              AND IFNULL(pi.consolidated_invoice, '') = ''
-            GROUP BY pi_item.item_code
+            SELECT reserved.item_code, SUM(reserved.qty) AS qty
+            FROM (
+                SELECT pi_item.item_code, pi_item.stock_qty AS qty
+                FROM `tabPOS Invoice Item` pi_item
+                INNER JOIN `tabPOS Invoice` pi ON pi.name = pi_item.parent
+                WHERE pi_item.docstatus = 1
+                  AND pi_item.item_code IN %(item_codes)s
+                  AND pi_item.warehouse = %(warehouse)s
+                  AND IFNULL(pi.consolidated_invoice, '') = ''
+                UNION ALL
+                SELECT packed.item_code, packed.qty
+                FROM `tabPacked Item` packed
+                INNER JOIN `tabPOS Invoice` pi ON pi.name = packed.parent
+                WHERE packed.docstatus = 1
+                  AND packed.item_code IN %(item_codes)s
+                  AND packed.warehouse = %(warehouse)s
+                  AND IFNULL(pi.consolidated_invoice, '') = ''
+            ) reserved
+            GROUP BY reserved.item_code
             """,
             {"item_codes": item_codes, "warehouse": warehouse},
             as_dict=True,
@@ -214,6 +240,14 @@ def get_items(
             actual = stock.get(item.item_code, 0)
             item["actual_qty"] = max(actual - reserved.get(item.item_code, 0), 0)
 
+    if should_hide and warehouse:
+        items = [
+            item
+            for item in items
+            if (not item.is_stock_item and not item.is_product_bundle)
+            or item.actual_qty > 0
+        ]
+
     return {"items": items}
 
 
@@ -234,7 +268,7 @@ def _get_group_and_children(item_group):
 @frappe.whitelist()
 def get_item_tax_templates(company=""):
     """Get available Item Tax Templates, optionally filtered by company."""
-    validate_pos_access()
+    validate_pos_access(permissions="read", doctype="Item Tax Template")
     filters = {}
     if company:
         filters["company"] = company
@@ -253,7 +287,7 @@ def get_item_tax_templates(company=""):
 def search_barcode(search_value, pos_profile=""):
     """Search for an item by barcode, item code, serial number, or batch number.
     Returns item details including rate from the POS Profile's price list."""
-    validate_pos_access(pos_profile or None)
+    validate_pos_access(pos_profile or None, permissions="read", doctype="Item")
 
     result = None
 
@@ -302,7 +336,11 @@ def search_barcode(search_value, pos_profile=""):
             }
 
     # Check Serial No
-    if not result and frappe.db.exists("Serial No", search_value):
+    if (
+        not result
+        and frappe.has_permission("Serial No", ptype="read")
+        and frappe.db.exists("Serial No", search_value)
+    ):
         sn = frappe.db.get_value("Serial No", search_value,
             ["name", "item_code", "batch_no"], as_dict=True)
         item = frappe.db.get_value("Item", sn.item_code,
@@ -321,7 +359,11 @@ def search_barcode(search_value, pos_profile=""):
             }
 
     # Check Batch
-    if not result and frappe.db.exists("Batch", search_value):
+    if (
+        not result
+        and frappe.has_permission("Batch", ptype="read")
+        and frappe.db.exists("Batch", search_value)
+    ):
         batch = frappe.db.get_value("Batch", search_value,
             ["name", "item"], as_dict=True)
         item = frappe.db.get_value("Item", batch.item,
@@ -379,15 +421,8 @@ def search_barcode(search_value, pos_profile=""):
             {"item_code": result["item_code"], "warehouse": warehouse},
             "actual_qty",
         ) or 0
-        # Subtract POS-reserved qty (submitted but unconsolidated POS Invoices)
-        reserved_qty = frappe.db.sql(
-            """SELECT SUM(pi_item.stock_qty) FROM `tabPOS Invoice Item` pi_item
-               INNER JOIN `tabPOS Invoice` pi ON pi.name = pi_item.parent
-               WHERE pi_item.docstatus = 1 AND pi_item.item_code = %s
-               AND pi_item.warehouse = %s AND IFNULL(pi.consolidated_invoice, '') = ''""",
-            (result["item_code"], warehouse),
-        )
-        reserved = (reserved_qty[0][0] or 0) if reserved_qty else 0
+        # Include both direct invoice rows and packed bundle components.
+        reserved = get_pos_reserved_qty(result["item_code"], warehouse)
         result["actual_qty"] = max(actual_qty - reserved, 0)
     else:
         result["actual_qty"] = 0
@@ -406,7 +441,11 @@ def search_barcode(search_value, pos_profile=""):
 @frappe.whitelist()
 def get_item_groups(pos_profile=""):
     """Get item groups, filtered by POS Profile if provided."""
-    validate_pos_access(pos_profile or None)
+    validate_pos_access(
+        pos_profile or None,
+        permissions="read",
+        doctype="Item Group",
+    )
     if pos_profile:
         profile = frappe.get_doc("POS Profile", pos_profile)
         if profile.item_groups:

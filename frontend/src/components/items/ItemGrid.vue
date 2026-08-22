@@ -7,6 +7,7 @@ import { useVirtualizer } from '@tanstack/vue-virtual'
 import { useItemsStore } from '@/stores/items'
 import { useCartStore } from '@/stores/cart'
 import { useSettingsStore } from '@/stores/settings'
+import { usePaymentStore } from '@/stores/payment'
 import { useBarcodeScanner } from '@/composables/useBarcodeScanner'
 import ItemCard from './ItemCard.vue'
 import ItemSearch from './ItemSearch.vue'
@@ -22,6 +23,7 @@ const { isDeskMode } = useDeskMode()
 const itemsStore = useItemsStore()
 const cartStore = useCartStore()
 const settingsStore = useSettingsStore()
+const paymentStore = usePaymentStore()
 const scrollContainer = ref<HTMLElement | null>(null)
 const showCameraScanner = ref(false)
 const columnCount = ref(4)
@@ -126,23 +128,34 @@ function onBatchSerialConfirm(batchNo: string | null, serialNo: string | null) {
   const item = batchSerialItem.value
   if (!item) return
 
-  // For serial items, serials may span multiple batches — auto-split
-  if (serialNo && item.has_batch_no && item.has_serial_no && !batchNo) {
-    // This case shouldn't happen with current UI (batch is required first),
-    // but handle it for safety
-    cartStore.addItem(item, settingsStore.validateStockOnSave)
-    const lastIndex = cartStore.items.length - 1
-    cartStore.updateItemBatchSerial(lastIndex, null, serialNo)
-  } else {
-    // Normal case: add item and set batch/serial
-    cartStore.addItem(item, settingsStore.validateStockOnSave)
-    const lastIndex = cartStore.items.length - 1
-    cartStore.updateItemBatchSerial(lastIndex, batchNo, serialNo)
-    // Set qty from serial count if serials were selected
-    if (serialNo) {
-      const serialCount = serialNo.split('\n').filter(s => s.trim()).length
-      if (serialCount > 1) {
-        cartStore.updateQty(lastIndex, serialCount)
+  const err = cartStore.addItem(item, settingsStore.validateStockOnSave, {
+    batchNo,
+    serialNo,
+  })
+  if (err) {
+    showStockError(err)
+    batchSerialItem.value = null
+    return
+  }
+
+  const targetIndex = cartStore.selectedItemIndex
+  if (targetIndex === null) {
+    batchSerialItem.value = null
+    return
+  }
+
+  if (serialNo) {
+    const serialCount = serialNo.split('\n').filter(s => s.trim()).length
+    if (serialCount > 1) {
+      const qtyError = cartStore.updateQty(
+        targetIndex,
+        serialCount,
+        undefined,
+        settingsStore.validateStockOnSave
+      )
+      if (qtyError) {
+        cartStore.removeItem(targetIndex)
+        showStockError(qtyError)
       }
     }
   }
@@ -151,13 +164,23 @@ function onBatchSerialConfirm(batchNo: string | null, serialNo: string | null) {
 
 // Hardware barcode scanner integration
 async function handleBarcodeScan(barcode: string) {
+  if (paymentStore.showPaymentDialog) return
   const result = await itemsStore.searchByBarcode(barcode)
+  if (paymentStore.showPaymentDialog) return
   if (result && result.item_code) {
     // Find item in full list or create minimal item for cart
     const existingItem = itemsStore.allItems.find((i) => i.item_code === result.item_code)
+    let targetIndex = -1
+    const barcodeOptions = {
+      uom: result.barcode_uom || undefined,
+      conversionFactor: result.barcode_conversion_factor || 1,
+      batchNo: result.batch_no || null,
+      serialNo: result.serial_no || null,
+    }
     if (existingItem) {
-      const err = cartStore.addItem(existingItem, settingsStore.validateStockOnSave)
+      const err = cartStore.addItem(existingItem, settingsStore.validateStockOnSave, barcodeOptions)
       if (err) { showStockError(err); return }
+      targetIndex = cartStore.selectedItemIndex ?? -1
     } else {
       // Add as minimal item — the backend will resolve full details
       const err = cartStore.addItem({
@@ -179,25 +202,12 @@ async function handleBarcodeScan(barcode: string) {
         barcode: result.barcode || null,
         item_tax_template: null,
         is_product_bundle: false,
-      }, settingsStore.validateStockOnSave)
+      }, settingsStore.validateStockOnSave, barcodeOptions)
       if (err) { showStockError(err); return }
-
-      // If scanned item has batch/serial info, update the cart item
-      if (result.batch_no || result.serial_no) {
-        const lastIndex = cartStore.items.length - 1
-        cartStore.updateItemBatchSerial(
-          lastIndex,
-          result.batch_no || null,
-          result.serial_no || null
-        )
-      }
+      targetIndex = cartStore.selectedItemIndex ?? -1
     }
 
-    // Apply barcode-specific UOM if returned by backend
-    if (result.barcode_uom) {
-      const lastIndex = cartStore.items.length - 1
-      cartStore.updateItemUom(lastIndex, result.barcode_uom, result.barcode_conversion_factor || 1)
-    }
+    if (targetIndex < 0) return
   }
 }
 

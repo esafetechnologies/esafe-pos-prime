@@ -61,7 +61,7 @@ const { isFullscreen, isLocked, enterFullscreen, resetIdleTimer } = useKioskMode
   },
 })
 
-// Payment terminal (mock for MVP)
+// Terminal calls remain fail-closed until a verified integration is configured.
 const terminal = usePaymentTerminal()
 
 // Barcode scanner
@@ -78,12 +78,9 @@ const cashMethodAvailable = computed(() =>
   )
 )
 
-const cardMethodName = computed(() => {
-  const card = settingsStore.paymentMethods.find(
-    (m) => !m.mode_of_payment.toLowerCase().includes('cash')
-  )
-  return card?.mode_of_payment ?? null
-})
+// Card checkout stays disabled until a terminal integration can return a
+// server-verifiable payment reference.
+const cardMethodAvailable = computed(() => false)
 
 const cashMethodName = computed(() => {
   const cash = settingsStore.paymentMethods.find(
@@ -169,9 +166,6 @@ async function initializeSession() {
       await customerStore.setCustomer(settingsStore.posProfile.customer)
     }
 
-    // Connect terminal (mock)
-    await terminal.connect()
-
     initializing.value = false
   } catch (e: any) {
     initError.value = e?.message || 'Failed to initialize kiosk session.'
@@ -180,8 +174,10 @@ async function initializeSession() {
 }
 
 async function handleBarcodeScan(barcode: string) {
+  if (!['welcome', 'phone_entry', 'scanning'].includes(step.value)) return
   resetIdleTimer()
   const result = await itemsStore.searchByBarcode(barcode)
+  if (!['welcome', 'phone_entry', 'scanning'].includes(step.value)) return
   const needsTransition = step.value === 'welcome' || step.value === 'phone_entry'
 
   if (result) {
@@ -306,26 +302,8 @@ async function payByCash() {
 }
 
 async function payByCard() {
-  step.value = 'processing'
-  paymentError.value = null
-  const amount = cartStore.roundedTotal ?? cartStore.grandTotal
-  const currency = settingsStore.currency || 'USD'
-
-  const result = await terminal.collectPayment(amount, currency)
-  if (result.success) {
-    try {
-      const methodName = cardMethodName.value || settingsStore.paymentMethods[0]?.mode_of_payment || 'Cash'
-      await submitInvoice(methodName)
-      step.value = 'complete'
-      startCompleteCountdown()
-    } catch (e: any) {
-      paymentError.value = extractErrorMessage(e)
-      step.value = 'payment'
-    }
-  } else {
-    paymentError.value = 'Card payment declined. Please try again.'
-    step.value = 'payment'
-  }
+  paymentError.value = 'Card payment is unavailable until a verified terminal is configured.'
+  step.value = 'payment'
 }
 
 function extractErrorMessage(e: any): string {
@@ -367,9 +345,10 @@ async function submitInvoice(paymentMethod: string) {
       .map((item) => ({
         item_code: item.item_code,
         qty: item.qty,
-        rate: item.rate,
-        discount_percentage: item.discount_percentage,
-        discount_amount: item.discount_amount || undefined,
+        rate: item.pricing_rules ? (item.price_list_rate ?? item.rate) : item.rate,
+        price_list_rate: item.price_list_rate ?? item.rate,
+        discount_percentage: item.pricing_rules ? 0 : item.discount_percentage,
+        discount_amount: item.pricing_rules ? undefined : (item.discount_amount || undefined),
         serial_no: item.serial_no || undefined,
         batch_no: item.batch_no || undefined,
         serial_and_batch_bundle: item.serial_and_batch_bundle || undefined,
@@ -523,6 +502,7 @@ function resetToWelcome() {
           v-else-if="step === 'payment'"
           :format-currency="formatCurrency"
           :cash-available="cashMethodAvailable"
+          :card-available="cardMethodAvailable"
           :error="paymentError"
           @pay-card="payByCard"
           @pay-cash="payByCash"

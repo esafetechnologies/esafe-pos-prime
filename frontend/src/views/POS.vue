@@ -78,8 +78,10 @@ const loading = ref(true)
 // Keyboard shortcuts
 useKeyboardShortcuts({
   onHoldOrder: () => holdOrder(),
-  onPay: () => {
+  onPay: async () => {
     if (cartStore.items.length > 0 && customerStore.customer) {
+      await cartStore.flushTaxCalculation()
+      if (cartStore.error) return
       paymentStore.openPaymentDialog()
     }
   },
@@ -343,19 +345,42 @@ async function holdOrder() {
   if (!customerStore.customer) return
 
   try {
+    const opts = cartStore.invoiceOptions || {}
     await draftsStore.saveDraft({
       customer: customerStore.customer.name,
       pos_profile: sessionStore.posProfile,
+      payments: paymentStore.payments.filter((payment) => payment.amount > 0),
       items: cartStore.items.filter((i) => !i.is_free_item).map((item) => ({
         item_code: item.item_code,
         qty: item.qty,
-        rate: item.rate,
-        discount_percentage: item.discount_percentage,
+        rate: item.pricing_rules ? (item.price_list_rate ?? item.rate) : item.rate,
+        price_list_rate: item.price_list_rate ?? item.rate,
+        discount_percentage: item.pricing_rules ? 0 : item.discount_percentage,
+        discount_amount: item.pricing_rules ? undefined : (item.discount_amount || undefined),
         serial_no: item.serial_no || undefined,
         batch_no: item.batch_no || undefined,
+        serial_and_batch_bundle: item.serial_and_batch_bundle || undefined,
         uom: item.uom || undefined,
         conversion_factor: item.conversion_factor || 1,
+        item_tax_template: item.item_tax_template || undefined,
+        margin_type: item.margin_type || undefined,
+        margin_rate_or_amount: item.margin_rate_or_amount || undefined,
+        description: item.description || undefined,
+        project: item.project || undefined,
+        weight_per_unit: item.weight_per_unit || undefined,
+        weight_uom: item.weight_uom || undefined,
       })),
+      additional_discount_percentage: cartStore.pricingRuleDiscount?.type === 'percentage'
+        ? cartStore.pricingRuleDiscount.value
+        : cartStore.additionalDiscountPercentage,
+      discount_amount: cartStore.pricingRuleDiscount?.type === 'amount'
+        ? cartStore.pricingRuleDiscount.value
+        : cartStore.additionalDiscountAmount,
+      apply_discount_on: cartStore.applyDiscountOn,
+      coupon_code: cartStore.couponCode || undefined,
+      ...Object.fromEntries(
+        Object.entries(opts).filter(([_, value]) => value != null && value !== '' && value !== false)
+      ),
     })
     startNewOrder()
   } catch {
@@ -378,14 +403,21 @@ async function resumeDraft(invoiceName: string) {
       await customerStore.setCustomer(draft.customer)
     }
 
+    if (itemsStore.allItems.length === 0) {
+      await itemsStore.fetchAllItems(sessionStore.posProfile)
+    }
+
     // Add items to cart
     for (const item of draft.items || []) {
+      const catalogItem = itemsStore.allItems.find((candidate) => candidate.item_code === item.item_code)
       cartStore.items.push({
         item_code: item.item_code,
         item_name: item.item_name,
-        rate: item.rate,
+        rate: item.pricing_rules
+          ? item.rate
+          : (item.price_list_rate ?? item.rate),
         qty: item.qty,
-        amount: item.amount || item.rate * item.qty,
+        amount: item.amount ?? item.rate * item.qty,
         uom: item.uom || '',
         discount_percentage: item.discount_percentage || 0,
         discount_amount: item.discount_amount || 0,
@@ -404,6 +436,10 @@ async function resumeDraft(invoiceName: string) {
         project: item.project || null,
         weight_per_unit: item.weight_per_unit || null,
         weight_uom: item.weight_uom || null,
+        actual_qty: catalogItem?.actual_qty ?? item.actual_qty,
+        is_stock_item: catalogItem?.is_stock_item ?? item.is_stock_item,
+        pricing_rules: item.pricing_rules || null,
+        price_list_rate: item.price_list_rate ?? null,
       })
     }
 
@@ -412,14 +448,46 @@ async function resumeDraft(invoiceName: string) {
       customer_address: draft.customer_address || null,
       shipping_address_name: draft.shipping_address_name || null,
       contact_person: draft.contact_person || null,
+      conversion_rate: draft.conversion_rate || null,
+      price_list_currency: draft.price_list_currency || null,
+      plc_conversion_rate: draft.plc_conversion_rate || null,
       sales_partner: draft.sales_partner || null,
+      commission_rate: draft.commission_rate || null,
       project: draft.project || null,
+      cost_center: draft.cost_center || null,
       remarks: draft.remarks || null,
       po_no: draft.po_no || null,
       po_date: draft.po_date || null,
+      set_posting_time: !!draft.set_posting_time,
+      posting_date: draft.posting_date || null,
+      posting_time: draft.posting_time || null,
+      naming_series: draft.naming_series || null,
       shipping_rule: draft.shipping_rule || null,
+      tc_name: draft.tc_name || null,
+      terms: draft.terms || null,
+      letter_head: draft.letter_head || null,
+      select_print_heading: draft.select_print_heading || null,
+      group_same_items: !!draft.group_same_items,
+      language: draft.language || null,
       payment_terms_template: draft.payment_terms_template || null,
+      allocate_advances_automatically: !!draft.allocate_advances_automatically,
+      debit_to: draft.debit_to || null,
+      sales_team: draft.sales_team || [],
     })
+
+    paymentStore.payments = (draft.payments || []).map((payment: any) => ({
+      mode_of_payment: payment.mode_of_payment,
+      amount: Number(payment.amount) || 0,
+    }))
+    paymentStore.activePaymentMethod =
+      paymentStore.payments.find((payment) => payment.amount > 0)?.mode_of_payment
+      || paymentStore.payments[0]?.mode_of_payment
+      || ''
+
+    // Restore the target before the value; it changes ERPNext's tax allocation.
+    cartStore.setApplyDiscountOn(
+      draft.apply_discount_on === 'Net Total' ? 'Net Total' : 'Grand Total'
+    )
 
     // Restore discount
     if (draft.additional_discount_percentage) {

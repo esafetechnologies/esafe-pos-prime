@@ -34,7 +34,7 @@ const weightUom = computed(() => {
     <!-- Net Total -->
     <div class="flex justify-between items-center text-gray-600 dark:text-gray-400 text-sm font-medium py-0.5">
       <span>{{ __('Net Total') }}</span>
-      <span>{{ formatCurrency(cartStore.subtotal) }}</span>
+      <span>{{ formatCurrency(cartStore.netTotal) }}</span>
     </div>
 
     <!-- Manual discount -->

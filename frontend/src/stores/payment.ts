@@ -115,6 +115,10 @@ export const usePaymentStore = defineStore('payment', () => {
     showPaymentDialog.value = false
   }
 
+  function recordInvoice(invoice: POSInvoice) {
+    lastInvoice.value = invoice
+  }
+
   function $reset() {
     payments.value = []
     activePaymentMethod.value = ''
@@ -141,6 +145,7 @@ export const usePaymentStore = defineStore('payment', () => {
     submitInvoice,
     openPaymentDialog,
     closePaymentDialog,
+    recordInvoice,
     $reset,
   }
 })

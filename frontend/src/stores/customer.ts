@@ -132,6 +132,11 @@ export const useCustomerStore = defineStore('customer', () => {
     } finally {
       loading.value = false
     }
+
+    // Customer group, territory, address, and tax category can all affect
+    // pricing and taxes, so refresh totals before checkout can continue.
+    const { useCartStore } = await import('@/stores/cart')
+    await useCartStore().flushTaxCalculation()
   }
 
   async function quickCreateCustomer(args: {

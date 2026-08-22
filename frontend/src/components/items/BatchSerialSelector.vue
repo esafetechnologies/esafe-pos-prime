@@ -52,6 +52,7 @@ onMounted(async () => {
 })
 
 async function selectBatch(batchNo: string) {
+  if (selectedBatch.value !== batchNo) selectedSerials.value = []
   selectedBatch.value = batchNo
   if (props.hasSerialNo) {
     loading.value = true
@@ -72,13 +73,18 @@ function toggleSerial(serialNo: string) {
   if (idx >= 0) {
     selectedSerials.value.splice(idx, 1)
   } else {
+    const needed = props.qty || 1
+    if (selectedSerials.value.length >= needed) {
+      toast.warning(`Select exactly ${needed} serial number${needed === 1 ? '' : 's'}`)
+      return
+    }
     selectedSerials.value.push(serialNo)
   }
 }
 
 function addSerialManual() {
   const sn = serialInput.value.trim()
-  if (sn && !selectedSerials.value.includes(sn)) {
+  if (sn && !selectedSerials.value.includes(sn) && selectedSerials.value.length < (props.qty || 1)) {
     selectedSerials.value.push(sn)
     serialInput.value = ''
   }
@@ -110,6 +116,7 @@ async function autoFetchSerials() {
 const canConfirm = computed(() => {
   if (props.hasBatchNo && !selectedBatch.value) return false
   if (props.hasSerialNo && selectedSerials.value.length === 0) return false
+  if (props.hasSerialNo && selectedSerials.value.length !== (props.qty || 1)) return false
   return true
 })
 
