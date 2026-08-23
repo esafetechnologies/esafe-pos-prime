@@ -94,7 +94,7 @@ async function load_pos_prime_assets() {
 		}
 
 		var cssFiles = new Set();
-		function collectCSS(chunk) {
+		var collectCSS = function collectCSS(chunk) {
 			if (chunk.css) {
 				chunk.css.forEach(function(f) { cssFiles.add(f); });
 			}
@@ -103,7 +103,7 @@ async function load_pos_prime_assets() {
 					if (manifest[key]) collectCSS(manifest[key]);
 				});
 			}
-		}
+		};
 		collectCSS(entry);
 
 		cssFiles.forEach(function(cssFile) {

@@ -21,7 +21,7 @@ def _format_order_response(invoice):
     response = format_invoice_response(invoice)
     tracking_by_item = {}
 
-    for item, item_response in zip(invoice.items, response.get("items", [])):
+    for item, item_response in zip(invoice.items, response.get("items", []), strict=False):
         if item.item_code not in tracking_by_item:
             tracking_by_item[item.item_code] = frappe.get_cached_value(
                 "Item",
@@ -65,7 +65,7 @@ def _parse_list(value, label):
 def _normalise_serial_nos(value):
     if not value:
         return []
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         serial_nos = value
     else:
         serial_nos = str(value).replace(",", "\n").splitlines()

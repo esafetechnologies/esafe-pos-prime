@@ -8,6 +8,8 @@ Built for speed, touch screens, and real retail workflows.
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Frappe](https://img.shields.io/badge/Frappe-v14%20|%20v15%20|%20v16-blue)](https://frappeframework.com)
+[![Server Tests](https://github.com/ravindu2012/pos-prime/actions/workflows/server-tests.yml/badge.svg)](https://github.com/ravindu2012/pos-prime/actions/workflows/server-tests.yml)
+[![Linters](https://github.com/ravindu2012/pos-prime/actions/workflows/linters.yml/badge.svg)](https://github.com/ravindu2012/pos-prime/actions/workflows/linters.yml)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-red)](https://github.com/sponsors/ravindu2012) [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ravindu2012)
 
 </div>
@@ -57,62 +59,62 @@ POS Prime does **not** add custom fields, custom doctypes, or modify any existin
 ## Screenshots
 
 ### POS - Item Grid
-Browse items by category with stock quantity badges, search by name or barcode, and add to cart with a single tap. Dark mode shown.
+Browse items by category with live stock badges, search by name or barcode, and add products with a single tap.
 
 ![POS Item Grid](screenshots/pos-item-grid.png)
 
-### POS - Cart
-Full cart sidebar with quantity controls, invoice discount, coupon code field, and real-time totals.
+### POS - Discounted Cart
+Adjust quantities and item discounts while net total, grand total, and checkout amount stay in sync.
 
 ![POS Cart](screenshots/pos-cart.png)
 
 ### POS - Payment
-Payment dialog with grand total, multiple payment method tabs (Cash, Credit Card, Bank Draft, Cheque), quick amount shortcuts, and Complete Payment button.
+Complete sales with multiple payment methods, split payments, and quick cash amount shortcuts.
 
 ![POS Payment](screenshots/pos-payment.png)
 
 ### POS - Payment Success
-Receipt screen showing "Payment Successful" with itemized invoice details, Print and New Order action buttons.
+Review the completed receipt, print or email it, then start the next order.
 
 ![POS Payment Success](screenshots/pos-payment-success.png)
 
 ### POS - Past Orders
-Searchable invoice list with status filter tabs (All, Paid, Return, Draft). Select an invoice to view items, payments, totals, and Print/Return actions.
+Search paid and returned invoices, then review items, payments, totals, and receipt actions.
 
 ![POS Orders](screenshots/pos-orders.png)
 
 ### POS - Returns
-Return Items dialog with customer info, item search, quantity and amount adjustment, refund method selection, and Process Return button.
+Select invoice items and quantities, choose a refund method, and submit a standard ERPNext return invoice.
 
 ![POS Returns](screenshots/pos-returns.png)
 
 ### POS - Customer 360
-Customer list with selected profile showing outstanding balance, contact details, and recent POS invoice history.
+See balances, loyalty details, and recent paid or returned invoices without leaving the POS.
 
 ![Customer 360](screenshots/pos-customer-360.png)
 
 ### Customer Display - Settings
-Customer Display panel in the sidebar with "Open Display Window" and "Connect VFD" options for setting up a customer-facing screen.
+Open a browser-based customer display or connect a supported serial VFD pole display.
 
 ![Customer Display](screenshots/pos-customer-display.png)
 
-### Customer Display - Popup
-Customer Display popup window showing the Welcome screen with phone number numpad entry for loyalty point lookup.
-
-![Customer Display Popup](screenshots/pos-customer-display-popup.png)
-
-### Customer Pole Display
-Full-screen customer-facing display showing company branding, live cart items with quantities and prices, subtotal, and grand total.
-
-![Customer Pole Display](screenshots/customer-pole-display.png)
-
 ### Customer Display - Welcome Screen
-Welcome screen with company logo, greeting message, phone number input with numpad, and Submit button.
+Let customers enter a mobile number for customer and loyalty lookup before checkout.
 
 ![Customer Display Welcome](screenshots/customer-display-welcome.png)
 
+### Customer Display - Live Cart
+Mirror company branding, customer, live cart items, discounts, and totals on a second screen.
+
+![Customer Pole Display](screenshots/customer-pole-display.png)
+
+### Close Shift Reconciliation
+Review shift invoices and expected balances before submitting the standard ERPNext POS Closing Entry.
+
+![Close Shift Reconciliation](screenshots/pos-close-shift.png)
+
 ### Denomination Calculator
-Cash Denomination Count dialog with Notes and Coins sections, quantity inputs per denomination, running totals, and Clear All/Apply buttons.
+Count notes and coins with a live total, then apply the reconciled cash balance to the shift.
 
 ![Denomination Calculator](screenshots/denomination-calculator.png)
 

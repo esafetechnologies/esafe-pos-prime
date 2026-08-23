@@ -18,6 +18,13 @@ import { Package, PanelLeftClose, PanelLeftOpen } from 'lucide-vue-next'
 import { useDeskMode } from '@/composables/useDeskMode'
 import type { Item } from '@/types'
 
+interface FrappeJQueryTarget {
+  on(eventName: 'toggleSidebar', handler: () => void): void
+  off(eventName: 'toggleSidebar', handler: () => void): void
+}
+
+declare const $: (target: HTMLElement) => FrappeJQueryTarget
+
 const { isDeskMode } = useDeskMode()
 
 const itemsStore = useItemsStore()

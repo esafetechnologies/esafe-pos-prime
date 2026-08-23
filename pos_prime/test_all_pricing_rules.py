@@ -85,7 +85,7 @@ def run_tests():
     has_strike = cart["price_list_rate"] is not None and cart["price_list_rate"] != cart["rate"]
     has_badge = cart["discount_percentage"] > 0
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} disc%={cart['discount_percentage']} amt={cart['amount']}"
-    print(f"\n  1. PRLE-0003: 10% Off Clutch Cover")
+    print("\n  1. PRLE-0003: 10% Off Clutch Cover")
     print(f"     {detail}")
     print(f"     Promo={has_promo} Strike={has_strike} Badge={has_badge}")
     check("PRLE-0003: 10% Off Clutch Cover",
@@ -98,7 +98,7 @@ def run_tests():
     has_strike = cart["price_list_rate"] is not None and cart["price_list_rate"] != cart["rate"]
     has_badge = cart["discount_amount"] > 0
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} discAmt={cart['discount_amount']} amt={cart['amount']}"
-    print(f"\n  2. PRLE-0004: LKR 500 Off Headlight")
+    print("\n  2. PRLE-0004: LKR 500 Off Headlight")
     print(f"     {detail}")
     print(f"     Promo={has_promo} Strike={has_strike} Badge={has_badge}")
     check("PRLE-0004: LKR 500 Off Headlight",
@@ -109,7 +109,7 @@ def run_tests():
     cart, _ = simulate_cart("14228", 9960, 1, data)
     has_promo = bool(cart["pricing_rules"])
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} amt={cart['amount']}"
-    print(f"\n  3. PRLE-0005: Fixed Rate Rectifier")
+    print("\n  3. PRLE-0005: Fixed Rate Rectifier")
     print(f"     {detail} (Promo badge, no strikethrough expected for fixed rate)")
     check("PRLE-0005: Fixed Rate Rectifier",
           abs(cart["amount"] - 8000) < 1 and has_promo, detail)
@@ -121,7 +121,7 @@ def run_tests():
     has_strike = cart["price_list_rate"] is not None and cart["price_list_rate"] != cart["rate"]
     has_badge = cart["discount_percentage"] > 0
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} disc%={cart['discount_percentage']} amt={cart['amount']}"
-    print(f"\n  4. PRLE-0006: 5% Off Honda Genuine")
+    print("\n  4. PRLE-0006: 5% Off Honda Genuine")
     print(f"     {detail}")
     check("PRLE-0006: 5% Off Honda Genuine",
           abs(cart["amount"] - 1472.5) < 1 and has_promo and has_strike and has_badge, detail)
@@ -133,7 +133,7 @@ def run_tests():
     has_strike = cart["price_list_rate"] is not None and cart["price_list_rate"] != cart["rate"]
     has_badge = cart["discount_percentage"] > 0
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} disc%={cart['discount_percentage']} amt={cart['amount']}"
-    print(f"\n  5. PRLE-0007: 8% Off Bajaj Brand")
+    print("\n  5. PRLE-0007: 8% Off Bajaj Brand")
     print(f"     {detail}")
     check("PRLE-0007: 8% Off Bajaj Brand",
           abs(cart["amount"] - 864.8) < 1 and has_promo and has_strike and has_badge, detail)
@@ -143,13 +143,13 @@ def run_tests():
     cart, free = simulate_cart("56166", 500, 2, data)
     has_free = len(free) > 0
     detail = f"free_items={len(free)} net={data.get('net_total')}"
-    print(f"\n  6. PRLE-0008: Buy 2 Get 1 Free Oil Filter")
+    print("\n  6. PRLE-0008: Buy 2 Get 1 Free Oil Filter")
     print(f"     {detail}")
     if has_free:
         for f in free:
             print(f"     -> {f['item_code']} qty={f['qty']} rate={f['rate']}")
     else:
-        print(f"     (same-item free product not added by ERPNext - config issue)")
+        print("     (same-item free product not added by ERPNext - config issue)")
     # WARN not FAIL — this is an ERPNext pricing rule config issue, not our UI
     results.append(("PRLE-0008: Buy 2 Get 1 Free", "WARN" if not has_free else "PASS", detail))
 
@@ -161,7 +161,7 @@ def run_tests():
     ])
     disc_pct = data.get("additional_discount_percentage") or 0
     detail = f"txn disc%={disc_pct} net={data.get('net_total')} grand={data.get('grand_total')}"
-    print(f"\n  7. PRLE-0009: 10% Off Orders Over 20K (Transaction)")
+    print("\n  7. PRLE-0009: 10% Off Orders Over 20K (Transaction)")
     print(f"     {detail}")
     check("PRLE-0009: 10% Off Over 20K (Txn)", disc_pct >= 10, detail)
 
@@ -172,7 +172,7 @@ def run_tests():
     no_disc_at_2 = len(data2.get("pricing_rules", [])) == 0
     has_disc_at_3 = bool(cart3["pricing_rules"])
     detail = f"qty=2 no_disc={no_disc_at_2} | qty=3 rate={cart3['rate']} disc%={cart3['discount_percentage']} amt={cart3['amount']}"
-    print(f"\n  8. PRLE-0010: 15% Off 3+ Chain Sprocket")
+    print("\n  8. PRLE-0010: 15% Off 3+ Chain Sprocket")
     print(f"     {detail}")
     check("PRLE-0010: 15% Off 3+ Chain Sprocket",
           no_disc_at_2 and has_disc_at_3 and abs(cart3["amount"] - 25372.5) < 1, detail)
@@ -183,7 +183,7 @@ def run_tests():
     has_promo = bool(cart["pricing_rules"])
     rate_up = cart["rate"] > 9950
     detail = f"rate={cart['rate']} plr={cart['price_list_rate']} (+10% margin, rate > plr)"
-    print(f"\n  9. PRLE-0011: 10% Margin Hub Sub Comp")
+    print("\n  9. PRLE-0011: 10% Margin Hub Sub Comp")
     print(f"     {detail}")
     check("PRLE-0011: 10% Margin", has_promo and rate_up, detail)
 
@@ -193,7 +193,7 @@ def run_tests():
     net_no = data_no.get("net_total", 0)
     net_yes = data_yes.get("net_total", 0)
     detail = f"without={net_no} with_coupon={net_yes}"
-    print(f"\n  10. Coupon SAVE20: 20% Off")
+    print("\n  10. Coupon SAVE20: 20% Off")
     print(f"      {detail}")
     check("Coupon SAVE20: 20% Off", net_yes < net_no, detail)
 
@@ -203,7 +203,7 @@ def run_tests():
     free_no = data_no.get("free_items", [])
     free_yes = data_yes.get("free_items", [])
     detail = f"without={len(free_no)} with_coupon={len(free_yes)}"
-    print(f"\n  11. Coupon FREEGIFT: Free Item")
+    print("\n  11. Coupon FREEGIFT: Free Item")
     print(f"      {detail}")
     if free_yes:
         for f in free_yes:
@@ -217,7 +217,7 @@ def run_tests():
     disc_yes = data_yes.get("discount_amount") or 0
     grand_yes = data_yes.get("grand_total", 0)
     detail = f"without disc={disc_no} | with disc={disc_yes} grand={grand_yes}"
-    print(f"\n  12. Coupon VIP1000: LKR 1000 Off")
+    print("\n  12. Coupon VIP1000: LKR 1000 Off")
     print(f"      {detail}")
     check("Coupon VIP1000: LKR 1000 Off", disc_yes >= 1000, detail)
 

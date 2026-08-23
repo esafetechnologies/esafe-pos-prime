@@ -51,6 +51,11 @@ ignore = [
     "F405", # can't detect undefined names from * import
     "F722", # syntax error in forward type annotation
     "W191", # indentation contains tabs
+    "UP030", # positional format fields may be used in translatable strings
+    "UP031", # percent formatting may be used in translatable strings
+    "UP032", # format calls may be used in translatable strings
+    "UP037", # retain quoted annotations for older supported versions
+    "UP040", # type statement requires Python 3.12+
 ]
 typing-modules = ["frappe.types.DF"]
 

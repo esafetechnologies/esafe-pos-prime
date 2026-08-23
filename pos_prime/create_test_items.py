@@ -56,7 +56,6 @@ def add_stock(item_code, qty, rate):
 
 def add_stock_with_batch(item_code, qty, rate, batch_id, expiry=None):
     """Add stock for batch items using serial_and_batch_bundle (v15)."""
-    batch = None
     if not frappe.db.exists("Batch", batch_id):
         batch_doc = frappe.get_doc({
             "doctype": "Batch",
@@ -404,12 +403,18 @@ def run():
         order_by="item_code")
     for i in test_items:
         flags = []
-        if i.has_serial_no: flags.append("SERIAL")
-        if i.has_batch_no: flags.append("BATCH")
-        if not i.is_stock_item and not i.is_fixed_asset: flags.append("NON-STOCK")
-        if i.is_fixed_asset: flags.append("ASSET")
-        if i.has_variants: flags.append("TEMPLATE")
-        if "VARIANT-TMPL-" in i.item_code: flags.append("VARIANT")
+        if i.has_serial_no:
+            flags.append("SERIAL")
+        if i.has_batch_no:
+            flags.append("BATCH")
+        if not i.is_stock_item and not i.is_fixed_asset:
+            flags.append("NON-STOCK")
+        if i.is_fixed_asset:
+            flags.append("ASSET")
+        if i.has_variants:
+            flags.append("TEMPLATE")
+        if "VARIANT-TMPL-" in i.item_code:
+            flags.append("VARIANT")
         flag_str = " [" + ", ".join(flags) + "]" if flags else ""
         print(f"  {i.item_code:30s} {i.item_name:40s} UOM={i.stock_uom}{flag_str}")
 

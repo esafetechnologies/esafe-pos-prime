@@ -156,8 +156,8 @@ function canReturn() {
                 <span v-if="item.discount_percentage > 0" class="text-orange-500 dark:text-orange-400">
                   (-{{ item.discount_percentage }}%)
                 </span>
-                <span v-else-if="item.discount_amount > 0" class="text-orange-500 dark:text-orange-400">
-                  (-{{ formatCurrency(item.discount_amount) }}/unit)
+                <span v-else-if="(item.discount_amount ?? 0) > 0" class="text-orange-500 dark:text-orange-400">
+                  (-{{ formatCurrency(item.discount_amount ?? 0) }}/unit)
                 </span>
                 <span v-if="item.uom && item.stock_uom && item.uom !== item.stock_uom" class="text-gray-400 dark:text-gray-500">
                   · {{ item.uom }}
@@ -240,9 +240,9 @@ function canReturn() {
           <span>{{ __('Change') }}</span>
           <span>{{ formatCurrency(order.change_amount) }}</span>
         </div>
-        <div v-if="order.outstanding_amount > 0" class="flex justify-between text-sm text-red-600 dark:text-red-400">
+        <div v-if="(order.outstanding_amount ?? 0) > 0" class="flex justify-between text-sm text-red-600 dark:text-red-400">
           <span>{{ __('Outstanding') }}</span>
-          <span>{{ formatCurrency(order.outstanding_amount) }}</span>
+          <span>{{ formatCurrency(order.outstanding_amount ?? 0) }}</span>
         </div>
         <div v-if="order.loyalty_points > 0" class="flex justify-between text-sm text-violet-500 dark:text-violet-400">
           <span>{{ __('Loyalty Redeemed') }}</span>
