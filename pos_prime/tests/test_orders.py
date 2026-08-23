@@ -134,22 +134,19 @@ class TestReturnItemSelection(TestCase):
 
 
 class TestReturnPayments(TestCase):
-	@patch(
-		"erpnext.accounts.doctype.sales_invoice.sales_invoice.get_mode_of_payment_info",
-		return_value=[
-			frappe._dict(
-				{
-					"type": "Cash",
-					"default_account": "Cash - TC",
-					"default": 1,
-				}
-			)
-		],
+	@patch.object(
+		orders,
+		"validate_pos_payment_accounts",
+		return_value={"Cash": frappe._dict({"type": "Cash", "default_account": "Cash - TC"})},
 	)
 	def test_payment_uses_calculated_document_total(self, _get_payment_info):
 		invoice = InvoiceStub(rounded_total=-12.5, grand_total=-12.49)
+		invoice.currency = "USD"
+		profile = frappe._dict(
+			{"name": "POS-PROFILE", "company": "Test Company", "payments": []}
+		)
 
-		orders._set_return_payment(invoice, "Cash")
+		orders._set_return_payment(invoice, "Cash", profile)
 
 		self.assertEqual(invoice.payments[0].amount, -12.5)
 		self.assertEqual(invoice.paid_amount, -12.5)
@@ -161,8 +158,12 @@ class TestReturnPayments(TestCase):
 	)
 	def test_zero_total_return_keeps_zero_payment(self, _get_payment_info):
 		invoice = InvoiceStub(rounded_total=0, grand_total=0)
+		invoice.currency = "USD"
+		profile = frappe._dict(
+			{"name": "POS-PROFILE", "company": "Test Company", "payments": []}
+		)
 
-		orders._set_return_payment(invoice, "Cash")
+		orders._set_return_payment(invoice, "Cash", profile)
 
 		self.assertEqual(invoice.payments[0].amount, 0)
 		self.assertEqual(invoice.paid_amount, 0)

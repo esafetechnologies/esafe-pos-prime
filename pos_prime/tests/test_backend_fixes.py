@@ -451,6 +451,70 @@ def advance(reference_name, available, allocated, reference_row=None):
 
 
 class TestStoreCreditConsolidation(TestCase):
+    @patch.object(POSPrimePOSInvoiceMergeLog, "_merge_store_credit_advances")
+    @patch(
+        "pos_prime.overrides.pos_invoice_merge_log.validate_pos_payment_accounts",
+        return_value={
+            "Ecocash": frappe._dict({"default_account": "Ecocash USD - TC"}),
+            "Refund": frappe._dict({"default_account": "Refund USD - TC"}),
+        },
+    )
+    @patch(
+        "erpnext.accounts.doctype.pos_invoice_merge_log.pos_invoice_merge_log."
+        "POSInvoiceMergeLog.merge_pos_invoice_into"
+    )
+    def test_merge_replaces_stale_nonzero_payment_accounts_for_v14(
+        self, core_merge, validate_accounts, merge_advances
+    ):
+        invoice = frappe._dict(
+            {
+                "company": "Test Company",
+                "currency": "USD",
+                "pos_profile": "Test POS Profile",
+                "payments": [
+                    frappe._dict(
+                        {
+                            "mode_of_payment": "Ecocash",
+                            "amount": 100,
+                            "account": "Old Ecocash ZWG - TC",
+                        }
+                    ),
+                    frappe._dict(
+                        {
+                            "mode_of_payment": "Refund",
+                            "amount": -10,
+                            "account": "Old Refund ZWG - TC",
+                        }
+                    ),
+                    frappe._dict(
+                        {
+                            "mode_of_payment": "Cash",
+                            "amount": 0,
+                            "account": "Zero Placeholder - TC",
+                        }
+                    ),
+                ],
+            }
+        )
+        core_merge.return_value = invoice
+        merge_log = object.__new__(POSPrimePOSInvoiceMergeLog)
+
+        result = merge_log.merge_pos_invoice_into(invoice, [])
+
+        self.assertIs(result, invoice)
+        self.assertEqual(invoice.payments[0].account, "Ecocash USD - TC")
+        self.assertEqual(invoice.payments[1].account, "Refund USD - TC")
+        self.assertEqual(invoice.payments[2].account, "Zero Placeholder - TC")
+        self.assertFalse(
+            validate_accounts.call_args.kwargs["require_profile_membership"]
+        )
+        self.assertFalse(validate_accounts.call_args.kwargs["require_enabled"])
+        self.assertEqual(
+            [row.mode_of_payment for row in validate_accounts.call_args.args[1]],
+            ["Ecocash", "Refund"],
+        )
+        merge_advances.assert_called_once_with(invoice, [])
+
     @patch.object(
         POSPrimePOSInvoiceMergeLog,
         "_lock_and_get_unadjusted_amount",
@@ -522,6 +586,28 @@ class TestStoreCreditConsolidation(TestCase):
         result = merge_log.process_merging_into_sales_invoice([])
 
         self.assertIs(result, invoice)
+        invoice.update_against_document_in_jv.assert_called_once_with()
+
+    @patch.object(frappe, "get_doc")
+    @patch(
+        "erpnext.accounts.doctype.pos_invoice_merge_log.pos_invoice_merge_log."
+        "POSInvoiceMergeLog.process_merging_into_sales_invoice",
+        return_value="SINV-0001",
+    )
+    def test_v14_string_merge_result_is_preserved(self, _core_process, get_doc):
+        invoice = frappe._dict(
+            {
+                "advances": [frappe._dict({"allocated_amount": 25})],
+                "update_against_document_in_jv": Mock(),
+            }
+        )
+        get_doc.return_value = invoice
+        merge_log = object.__new__(POSPrimePOSInvoiceMergeLog)
+
+        result = merge_log.process_merging_into_sales_invoice([])
+
+        self.assertEqual(result, "SINV-0001")
+        get_doc.assert_called_once_with("Sales Invoice", "SINV-0001")
         invoice.update_against_document_in_jv.assert_called_once_with()
 
     @patch(

@@ -9,24 +9,62 @@ from erpnext.accounts.doctype.pos_invoice_merge_log.pos_invoice_merge_log import
     POSInvoiceMergeLog,
 )
 
+from pos_prime.api._utils import validate_pos_payment_accounts
+
 
 class POSPrimePOSInvoiceMergeLog(POSInvoiceMergeLog):
     """Carry POS Prime store-credit allocations into the accounting invoice."""
 
     def merge_pos_invoice_into(self, invoice, data):
         invoice = super().merge_pos_invoice_into(invoice, data)
+        self._canonicalize_payment_accounts(invoice)
         self._merge_store_credit_advances(invoice, data)
         return invoice
 
+    def _canonicalize_payment_accounts(self, invoice):
+        """Replace historical payment accounts with the current company mapping."""
+        payments = [
+            payment
+            for payment in invoice.get("payments") or []
+            if flt(payment.get("amount"))
+        ]
+        if not payments:
+            return
+
+        profile_context = frappe._dict(
+            {
+                "name": invoice.get("pos_profile") or "Consolidated POS",
+                "company": invoice.company,
+                "currency": invoice.currency,
+                "payments": [],
+            }
+        )
+        resolved = validate_pos_payment_accounts(
+            profile_context,
+            payments,
+            company=invoice.company,
+            currency=invoice.currency,
+            require_profile_membership=False,
+            require_enabled=False,
+        )
+
+        for payment in payments:
+            payment.account = resolved[payment.mode_of_payment].default_account
+
     def process_merging_into_sales_invoice(self, data):
         """Submit through ERPNext, then reconcile advances skipped for POS sales."""
-        invoice = super().process_merging_into_sales_invoice(data)
+        result = super().process_merging_into_sales_invoice(data)
+        invoice = (
+            frappe.get_doc("Sales Invoice", result)
+            if isinstance(result, str)
+            else result
+        )
         if invoice.get("advances"):
             # SalesInvoice.on_submit deliberately skips this for is_pos=1.
             # The merge and reconciliation share one transaction, including the
             # source-row locks acquired while the advances are assembled.
             invoice.update_against_document_in_jv()
-        return invoice
+        return result
 
     def on_cancel(self):
         """Release consolidated references before ERPNext cancels the invoice."""

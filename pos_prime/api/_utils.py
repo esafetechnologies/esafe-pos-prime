@@ -103,6 +103,143 @@ def safe_float(value, default=0):
         return default
 
 
+def validate_pos_payment_accounts(
+    profile,
+    payments,
+    *,
+    company=None,
+    currency=None,
+    require_profile_membership=True,
+    returns_only=False,
+    require_enabled=True,
+):
+    """Validate POS payment modes against their company account mappings.
+
+    ERPNext resolves a Mode of Payment account for the transaction company and
+    permits that account in either the company currency or the transaction
+    currency. Validate the same boundary before persisting a POS document so a
+    bad mapping cannot surface later while the shift is being consolidated.
+    """
+    if isinstance(profile, str):
+        profile = frappe.get_doc("POS Profile", profile)
+
+    profile_company = profile.get("company")
+    company = company or profile_company
+    if not company or (profile_company and company != profile_company):
+        frappe.throw(_("Payment company must match the selected POS Profile."))
+
+    company_currency = frappe.db.get_value("Company", company, "default_currency")
+    if not company_currency:
+        frappe.throw(_("Company {0} has no default currency.").format(company))
+
+    transaction_currency = currency or profile.get("currency") or company_currency
+    allowed_currencies = [company_currency]
+    if transaction_currency not in allowed_currencies:
+        allowed_currencies.append(transaction_currency)
+
+    profile_modes = {
+        row.get("mode_of_payment")
+        for row in profile.get("payments") or []
+        if row.get("mode_of_payment")
+        and (not returns_only or row.get("allow_in_returns"))
+    }
+
+    validated = {}
+    for payment in payments or []:
+        if isinstance(payment, str):
+            mode_of_payment = payment
+        else:
+            amount = payment.get("amount")
+            if amount is not None and not flt(amount):
+                continue
+            mode_of_payment = payment.get("mode_of_payment")
+
+        if not mode_of_payment:
+            frappe.throw(_("Every POS payment row must include a Mode of Payment."))
+
+        if require_profile_membership and mode_of_payment not in profile_modes:
+            if returns_only:
+                frappe.throw(
+                    _(
+                        "Mode of Payment {0} is not allowed for returns in POS Profile {1}."
+                    ).format(mode_of_payment, profile.name)
+                )
+            frappe.throw(
+                _("Mode of Payment {0} is not configured in POS Profile {1}.").format(
+                    mode_of_payment, profile.name
+                )
+            )
+
+        payment_info = validated.get(mode_of_payment)
+        if not payment_info:
+            mode = frappe.db.get_value(
+                "Mode of Payment",
+                mode_of_payment,
+                ["enabled", "type"],
+                as_dict=True,
+            )
+            if not mode:
+                frappe.throw(
+                    _("Mode of Payment {0} does not exist.").format(mode_of_payment)
+                )
+            if require_enabled and not mode.get("enabled"):
+                frappe.throw(
+                    _("Mode of Payment {0} is disabled.").format(mode_of_payment)
+                )
+
+            account = frappe.db.get_value(
+                "Mode of Payment Account",
+                {"parent": mode_of_payment, "company": company},
+                "default_account",
+            )
+            if not account:
+                frappe.throw(
+                    _("Mode of Payment {0} has no account for company {1}.").format(
+                        mode_of_payment, company
+                    )
+                )
+
+            account_info = frappe.db.get_value(
+                "Account",
+                account,
+                ["company", "account_currency", "is_group", "disabled"],
+                as_dict=True,
+            )
+            if not account_info:
+                frappe.throw(
+                    _("Mode of Payment {0} references missing account {1}.").format(
+                        mode_of_payment, account
+                    )
+                )
+            if account_info.get("company") != company:
+                frappe.throw(
+                    _("Account {0} does not belong to company {1}.").format(
+                        account, company
+                    )
+                )
+            if account_info.get("is_group"):
+                frappe.throw(_("Payment account {0} must be a ledger account.").format(account))
+            if account_info.get("disabled"):
+                frappe.throw(_("Payment account {0} is disabled.").format(account))
+            if account_info.get("account_currency") not in allowed_currencies:
+                frappe.throw(
+                    _("Account {0} is invalid. Account Currency must be {1}").format(
+                        account, (" " + _("or") + " ").join(allowed_currencies)
+                    )
+                )
+
+            payment_info = frappe._dict(
+                {
+                    "type": mode.get("type"),
+                    "default_account": account,
+                    "account_currency": account_info.get("account_currency"),
+                }
+            )
+            validated[mode_of_payment] = payment_info
+
+    return validated
+
+
 def get_allowed_invoice_discount(profile, percentage=0, amount=0):
     """Validate invoice discounts and ignore client overrides when disabled."""
     if not getattr(profile, "allow_discount_change", 0):

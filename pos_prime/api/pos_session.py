@@ -11,6 +11,7 @@ from pos_prime.api._utils import (
     validate_doctype_permissions,
     validate_pos_access,
     validate_pos_document_access,
+    validate_pos_payment_accounts,
 )
 
 
@@ -65,6 +66,75 @@ def _validate_opening_access(opening, permissions="read"):
         permissions=permissions,
         owner_field="user",
     )
+
+
+def _validate_closing_payment_accounts(opening, closing):
+    """Preflight every payment account before a closing document is inserted."""
+    profile = frappe.get_doc("POS Profile", opening.pos_profile)
+
+    modes_by_currency = {}
+    for invoice_name in sorted(_closing_invoice_names(closing)):
+        invoice = frappe.get_doc("POS Invoice", invoice_name)
+        key = (invoice.company, invoice.currency)
+        modes = modes_by_currency.setdefault(key, set())
+        for payment in invoice.get("payments") or []:
+            if flt(payment.get("amount")):
+                modes.add(payment.get("mode_of_payment"))
+
+    for (company, currency), modes in modes_by_currency.items():
+        if not modes:
+            continue
+        validate_pos_payment_accounts(
+            profile,
+            [
+                {"mode_of_payment": mode, "amount": 1}
+                for mode in sorted(modes, key=lambda value: str(value))
+            ],
+            company=company,
+            currency=currency,
+            # A legacy invoice must remain closable if its payment mode was
+            # later removed or disabled. Validate its current company mapping;
+            # the historical account value is intentionally not authoritative.
+            require_profile_membership=False,
+            require_enabled=False,
+        )
+
+
+def _closing_invoice_names(closing):
+    transactions = closing.get("pos_transactions") or closing.get("pos_invoices") or []
+    return {
+        row.get("pos_invoice") for row in transactions if row.get("pos_invoice")
+    }
+
+
+def _closing_invoice_snapshot(closing):
+    """Return a version-neutral, typed invoice set for safe failed retries."""
+    invoice_keys = set()
+    for collection, fieldname, doctype in (
+        ("pos_transactions", "pos_invoice", "POS Invoice"),
+        ("pos_invoices", "pos_invoice", "POS Invoice"),
+        ("sales_invoices", "sales_invoice", "Sales Invoice"),
+    ):
+        for row in closing.get(collection) or []:
+            if row.get(fieldname):
+                invoice_keys.add((doctype, row.get(fieldname)))
+    return invoice_keys
+
+
+def _failed_closing_matches_current(failed_closing, current_closing):
+    """Reject retry only when its frozen invoice scope is no longer safe."""
+    failed = _closing_invoice_snapshot(failed_closing)
+    current = _closing_invoice_snapshot(current_closing)
+    failed_pos = {name for doctype, name in failed if doctype == "POS Invoice"}
+    current_pos = {name for doctype, name in current if doctype == "POS Invoice"}
+    failed_sales = {name for doctype, name in failed if doctype == "Sales Invoice"}
+    current_sales = {name for doctype, name in current if doctype == "Sales Invoice"}
+
+    # POS Invoices remain discoverable until they consolidate, so a difference
+    # indicates new invoices or a partial merge. V16 links Sales Invoices to the
+    # closing before an async job finishes, so they may disappear from a fresh
+    # snapshot; only newly discovered Sales Invoices make the retry unsafe.
+    return current_pos == failed_pos and current_sales.issubset(failed_sales)
 
 
 @frappe.whitelist()
@@ -354,23 +424,62 @@ def close_shift(opening_entry, closing_amounts=None):
         permissions=("create", "submit"),
     )
 
-    # If opening entry is already closed, check if a closing entry exists
-    # (handles retries after partial failures like scheduler being inactive)
-    if opening.status != "Open" or opening.docstatus != 1:
-        existing_closing = frappe.db.get_value(
-            "POS Closing Entry",
-            {"pos_opening_entry": opening_entry, "docstatus": 1},
-            "name",
+    # Serialize close attempts for this shift. ERPNext commits after synchronous
+    # consolidation, and queued closes persist before the request releases the
+    # lock, so a second request will observe the same closing document.
+    frappe.db.sql(
+        "SELECT name FROM `tabPOS Opening Entry` WHERE name = %s FOR UPDATE",
+        (opening_entry,),
+    )
+    opening.reload()
+    _validate_opening_access(opening)
+
+    # A failed consolidation is still a submitted closing document. Reuse it
+    # instead of creating duplicates on every retry.
+    existing_closing_name = frappe.db.get_value(
+        "POS Closing Entry",
+        {"pos_opening_entry": opening_entry, "docstatus": 1},
+        "name",
+        order_by="creation desc",
+    )
+    if existing_closing_name:
+        existing_closing = frappe.get_doc(
+            "POS Closing Entry", existing_closing_name
         )
-        if existing_closing:
-            closing_status = frappe.db.get_value(
-                "POS Closing Entry", existing_closing, "status"
-            )
-            return {"name": existing_closing, "status": closing_status}
+        if existing_closing.status == "Failed":
+            if opening.status != "Open" or opening.docstatus != 1:
+                frappe.throw(
+                    _("Opening entry {0} is not available for retry.").format(
+                        opening_entry
+                    )
+                )
+
+            current_closing = make_closing_entry_from_opening(opening)
+            if not _failed_closing_matches_current(
+                existing_closing, current_closing
+            ):
+                frappe.throw(
+                    _(
+                        "Failed closing entry {0} no longer matches the shift invoices. "
+                        "Resolve or cancel it before closing this shift again."
+                    ).format(existing_closing.name)
+                )
+
+            _validate_closing_payment_accounts(opening, existing_closing)
+            existing_closing.retry()
+            existing_closing.reload()
+
+        return {
+            "name": existing_closing.name,
+            "status": existing_closing.status,
+        }
+
+    if opening.status != "Open" or opening.docstatus != 1:
         frappe.throw(_("Opening entry {0} is not open or not submitted").format(opening_entry))
 
     # Use ERPNext's built-in function to build the closing entry
     closing = make_closing_entry_from_opening(opening)
+    _validate_closing_payment_accounts(opening, closing)
 
     payment_summary = _build_payment_summary(opening, closing)
 

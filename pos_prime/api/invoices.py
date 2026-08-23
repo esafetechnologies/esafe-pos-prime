@@ -21,6 +21,7 @@ from pos_prime.api._utils import (
     get_remaining_invoice_amount,
     set_pos_change_amount,
     set_pos_paid_amount,
+    validate_pos_payment_accounts,
     validate_supplemental_settlement,
 )
 
@@ -290,6 +291,13 @@ def create_pos_invoice(
         frappe.throw(_("Store credit cannot be negative."))
 
     invoice.set_missing_values()
+    validate_pos_payment_accounts(
+        profile,
+        invoice.payments,
+        company=invoice.company,
+        currency=invoice.currency,
+        returns_only=bool(invoice.get("is_return")),
+    )
     apply_item_discount_policy(invoice, items, profile)
     # set_missing_values populates accounts/item defaults but does not calculate
     # the transaction total. Store-credit caps must use the final taxed total.

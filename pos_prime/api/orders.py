@@ -11,6 +11,7 @@ from pos_prime.api._utils import (
     format_invoice_response,
     validate_pos_access,
     validate_pos_document_access,
+    validate_pos_payment_accounts,
     set_campaign_from_profile,
 )
 
@@ -267,26 +268,38 @@ def _get_requested_payment_mode(payments):
     return payments[0].get("mode_of_payment")
 
 
-def _set_return_payment(invoice, mode_of_payment):
+def _set_return_payment(invoice, mode_of_payment, profile=None):
     """Set the refund from ERPNext's calculated total, never client arithmetic."""
     invoice.calculate_taxes_and_totals()
     invoice_total = flt(invoice.rounded_total) or flt(invoice.grand_total)
     if invoice_total > 0:
         frappe.throw(_("A return invoice cannot have a positive total."))
 
-    from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
-        get_mode_of_payment_info,
-    )
-
-    payment_info = get_mode_of_payment_info(mode_of_payment, invoice.company)
-    if not payment_info:
-        frappe.throw(
-            _("Mode of Payment {0} has no account for company {1}.").format(
-                mode_of_payment, invoice.company
-            )
+    profile = profile or frappe.get_doc("POS Profile", invoice.pos_profile)
+    if invoice_total:
+        payment_info = validate_pos_payment_accounts(
+            profile,
+            [{"mode_of_payment": mode_of_payment, "amount": invoice_total}],
+            company=invoice.company,
+            currency=invoice.currency,
+            returns_only=True,
+        )[mode_of_payment]
+    else:
+        # A zero-total return needs ERPNext's placeholder row but posts no
+        # payment GL. Resolve the current mapping without applying a currency
+        # rule to an account that will not be used.
+        from erpnext.accounts.doctype.sales_invoice.sales_invoice import (
+            get_mode_of_payment_info,
         )
 
-    payment_info = payment_info[0]
+        payment_rows = get_mode_of_payment_info(mode_of_payment, invoice.company)
+        if not payment_rows:
+            frappe.throw(
+                _("Mode of Payment {0} has no account for company {1}.").format(
+                    mode_of_payment, invoice.company
+                )
+            )
+        payment_info = payment_rows[0]
     base_amount = flt(invoice_total * flt(invoice.conversion_rate or 1))
     invoice.set("payments", [])
     invoice.append(
@@ -307,11 +320,11 @@ def _set_return_payment(invoice, mode_of_payment):
     invoice.base_change_amount = 0
 
 
-def _resync_return_payment(invoice, mode_of_payment):
+def _resync_return_payment(invoice, mode_of_payment, profile=None):
     expected_total = flt(invoice.rounded_total) or flt(invoice.grand_total)
     current_amount = flt(invoice.payments[0].amount) if len(invoice.payments) == 1 else 0
     if flt(invoice.paid_amount) != expected_total or current_amount != expected_total:
-        _set_return_payment(invoice, mode_of_payment)
+        _set_return_payment(invoice, mode_of_payment, profile)
         invoice.save()
 
 
@@ -549,9 +562,9 @@ def submit_return_invoice(invoice_name, items, payments):
         )
 
         _apply_return_item_selection(invoice, items)
-        _set_return_payment(invoice, mode_of_payment)
+        _set_return_payment(invoice, mode_of_payment, profile)
         invoice.save()
-        _resync_return_payment(invoice, mode_of_payment)
+        _resync_return_payment(invoice, mode_of_payment, profile)
         invoice.submit()
 
         return _format_order_response(invoice)
@@ -683,9 +696,9 @@ def create_manual_return(customer, pos_profile, items, mode_of_payment):
             invoice.append("items", item_dict)
 
         invoice.set_missing_values()
-        _set_return_payment(invoice, mode_of_payment)
+        _set_return_payment(invoice, mode_of_payment, profile)
         invoice.insert()
-        _resync_return_payment(invoice, mode_of_payment)
+        _resync_return_payment(invoice, mode_of_payment, profile)
         invoice.submit()
 
         return _format_order_response(invoice)

@@ -22,6 +22,7 @@ from pos_prime.api._utils import (
     set_pos_change_amount,
     set_pos_paid_amount,
     validate_pos_document_access,
+    validate_pos_payment_accounts,
     validate_supplemental_settlement,
 )
 
@@ -184,6 +185,13 @@ def save_draft_invoice(
     )
 
     invoice.set_missing_values()
+    validate_pos_payment_accounts(
+        profile,
+        invoice.payments,
+        company=invoice.company,
+        currency=invoice.currency,
+        returns_only=bool(invoice.get("is_return")),
+    )
     apply_item_discount_policy(invoice, items, profile)
     invoice.insert()
     # Do NOT submit -- leave as draft
@@ -493,6 +501,13 @@ def update_and_submit_draft(
 
     invoice.account_for_change_amount = profile.account_for_change_amount
     invoice.set_missing_values()
+    validate_pos_payment_accounts(
+        profile,
+        invoice.payments,
+        company=invoice.company,
+        currency=invoice.currency,
+        returns_only=bool(invoice.get("is_return")),
+    )
     apply_item_discount_policy(invoice, items, profile)
     if taxes is not None and not taxes:
         invoice.taxes_and_charges = None
