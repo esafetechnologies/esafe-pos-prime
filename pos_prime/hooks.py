@@ -6,7 +6,7 @@ app_title = "POS Prime"
 app_publisher = "Ravindu Gajanayaka"
 app_description = "Custom POS App for ERPNext"
 app_email = "ravindu@example.com"
-app_license = "mit"
+app_license = "GNU General Public License (v3)"
 
 required_apps = ["erpnext"]
 
